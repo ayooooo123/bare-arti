@@ -54,6 +54,7 @@ jobs:
             build-essential \
             ca-certificates \
             clang \
+            curl \
             git \
             lld
 
