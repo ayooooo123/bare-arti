@@ -1,0 +1,34 @@
+[package]
+name = "bare-arti"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Embedded Arti (Rust Tor) SOCKS5 proxy, exposed as a Bare native addon"
+
+# The core remains an rlib for the sidecar. addon/Cargo.toml wraps it in the
+# staticlib required by cmake-cargo and the Bare module shim.
+[lib]
+crate-type = ["rlib"]
+
+# Standalone runner for local verification without the Bare toolchain.
+[[bin]]
+name = "arti-socks"
+path = "src/bin/arti-socks.rs"
+
+[dependencies]
+arti-client = { version = "0.44", default-features = false, features = [
+  "tokio",
+  "rustls",
+  "onion-service-client",
+] }
+tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
+# rustls 0.23 requires a process-level CryptoProvider to be installed explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "macros",
+  "sync",
+] }
+anyhow = "1"

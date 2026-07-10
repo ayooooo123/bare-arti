@@ -1,0 +1,16 @@
+[package]
+name = "bare-arti-addon"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "../src/binding.rs"
+
+[dependencies]
+anyhow = "1"
+bare-arti = { path = ".." }
+bare-rust = "0.0.18"
+tokio = { version = "1", features = ["rt-multi-thread"] }

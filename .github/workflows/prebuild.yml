@@ -1,0 +1,242 @@
+name: Prebuild sidecars
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prebuild-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  sidecar:
+    name: Sidecar (${{ matrix.platform }}-${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: x64
+            runner: ubuntu-latest
+            container: ubuntu:22.04
+          - platform: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            container: ubuntu:22.04
+          - platform: darwin
+            arch: x64
+            runner: macos-15-intel
+          - platform: darwin
+            arch: arm64
+            runner: macos-15
+          - platform: win32
+            arch: x64
+            runner: windows-latest
+    steps:
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            git \
+            lld
+
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Build and archive sidecar
+        shell: bash
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euxo pipefail
+          export CARGO_PROFILE_RELEASE_STRIP=symbols
+          cargo build --locked --release --bin arti-socks
+
+          destination="prebuilds/${PLATFORM}-${ARCH}"
+          mkdir -p "$destination"
+          if [[ "$PLATFORM" == 'win32' ]]; then
+            cp target/release/arti-socks.exe "$destination/arti-socks.exe"
+          else
+            cp target/release/arti-socks "$destination/arti-socks"
+            chmod 755 "$destination/arti-socks"
+          fi
+
+          tar -czf "sidecar-${PLATFORM}-${ARCH}.tar.gz" \
+            -C prebuilds "${PLATFORM}-${ARCH}"
+
+      - name: Upload archived prebuild
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sidecar-${{ matrix.platform }}-${{ matrix.arch }}
+          path: sidecar-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble release bundle
+    needs: sidecar
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: lts/*
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euxo pipefail
+          expected="v$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "$expected"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Test exact release source
+        run: npm test
+
+      - name: Download sidecar archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sidecar-*
+          path: downloaded-sidecars
+          merge-multiple: true
+
+      - name: Assemble and verify prebuilds
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p prebuilds platform-archives
+
+          printf '%s\n' \
+            downloaded-sidecars/sidecar-darwin-arm64.tar.gz \
+            downloaded-sidecars/sidecar-darwin-x64.tar.gz \
+            downloaded-sidecars/sidecar-linux-arm64.tar.gz \
+            downloaded-sidecars/sidecar-linux-x64.tar.gz \
+            downloaded-sidecars/sidecar-win32-x64.tar.gz \
+            > expected-archives.txt
+          find downloaded-sidecars -type f | sort > actual-archives.txt
+          diff -u expected-archives.txt actual-archives.txt
+
+          for archive in downloaded-sidecars/*.tar.gz; do
+            cp "$archive" platform-archives/
+            tar -xzf "$archive" -C prebuilds
+          done
+
+          chmod 755 \
+            prebuilds/linux-x64/arti-socks \
+            prebuilds/linux-arm64/arti-socks \
+            prebuilds/darwin-x64/arti-socks \
+            prebuilds/darwin-arm64/arti-socks
+
+          printf '%s\n' \
+            prebuilds/darwin-arm64/arti-socks \
+            prebuilds/darwin-x64/arti-socks \
+            prebuilds/linux-arm64/arti-socks \
+            prebuilds/linux-x64/arti-socks \
+            prebuilds/win32-x64/arti-socks.exe > expected-prebuilds.txt
+          find prebuilds -type f | sort > actual-prebuilds.txt
+          diff -u expected-prebuilds.txt actual-prebuilds.txt
+
+          test -x prebuilds/linux-x64/arti-socks
+          test -x prebuilds/linux-arm64/arti-socks
+          test -x prebuilds/darwin-x64/arti-socks
+          test -x prebuilds/darwin-arm64/arti-socks
+
+      - name: Pack and inspect npm tarball
+        shell: bash
+        run: |
+          set -euxo pipefail
+          npm pack --json > pack-result.json
+          package_tarball="$(node -e \
+            "process.stdout.write(require('./pack-result.json')[0].filename)")"
+          mkdir package-check
+          tar -xzf "$package_tarball" -C package-check
+
+          printf '%s\n' \
+            package-check/package/prebuilds/darwin-arm64/arti-socks \
+            package-check/package/prebuilds/darwin-x64/arti-socks \
+            package-check/package/prebuilds/linux-arm64/arti-socks \
+            package-check/package/prebuilds/linux-x64/arti-socks \
+            package-check/package/prebuilds/win32-x64/arti-socks.exe \
+            > expected-package-prebuilds.txt
+          find package-check/package/prebuilds -type f | sort \
+            > actual-package-prebuilds.txt
+          diff -u expected-package-prebuilds.txt actual-package-prebuilds.txt
+
+          test -x package-check/package/prebuilds/linux-x64/arti-socks
+          test -x package-check/package/prebuilds/linux-arm64/arti-socks
+          test -x package-check/package/prebuilds/darwin-x64/arti-socks
+          test -x package-check/package/prebuilds/darwin-arm64/arti-socks
+
+          mkdir release-bundle
+          cp "$package_tarball" release-bundle/
+          cp platform-archives/*.tar.gz release-bundle/
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-bundle
+          path: release-bundle/
+          if-no-files-found: error
+
+  release:
+    name: Attach bundle to GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-bundle
+          path: release-bundle
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euxo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --generate-notes
+          fi
+          gh release upload "$TAG" \
+            release-bundle/*.tgz \
+            release-bundle/*.tar.gz \
+            --clobber
+
+# The Bare-addon job is intentionally omitted for now. Local Rust type-checking
+# passes, but cmake-bare build/install and require.addon() loading remain
+# unverified; the current addon bootstrap also blocks and has no timeout. Add an
+# addon prebuild matrix only after that full path works on at least one runner.
