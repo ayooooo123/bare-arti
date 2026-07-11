@@ -286,26 +286,9 @@ dependencies = [
 name = "bare-arti-addon"
 version = "0.0.1"
 dependencies = [
- "anyhow",
  "bare-arti",
- "bare-rust",
  "tokio",
 ]
-
-[[package]]
-name = "bare-rust"
-version = "0.0.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2707437ad338d5f03c8b7264daf76d83f5fdfbd155e43f0c02b5a071d840a99"
-dependencies = [
- "bare-rust-ffi",
-]
-
-[[package]]
-name = "bare-rust-ffi"
-version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caf98c59c8f2f33d8cd6f5dfbfde16114935c8ec037f8e3eb3314da146d57223"
 
 [[package]]
 name = "base16ct"
