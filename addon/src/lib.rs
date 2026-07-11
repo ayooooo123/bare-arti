@@ -105,7 +105,7 @@ fn c_string(value: &str) -> CString {
     })
 }
 
-fn invoke(
+fn invoke_once(
     callback: unsafe extern "C" fn(*mut c_void, *const BareArtiResult),
     context: usize,
     event: ServiceEvent,
@@ -115,12 +115,20 @@ fn invoke(
         | ServiceEvent::Failed { generation, .. }
         | ServiceEvent::Stopped { generation } => *generation,
     };
-    let (port, code, message) = match event {
+    let prepared = catch_unwind(AssertUnwindSafe(|| match event {
         ServiceEvent::Running { port, .. } => (port, None, None),
         ServiceEvent::Stopped { .. } => (0, None, None),
         ServiceEvent::Failed { code, message, .. } => {
             (0, Some(c_string(code)), Some(c_string(&message)))
         }
+    }));
+    let (port, code, message) = match prepared {
+        Ok(prepared) => prepared,
+        Err(_) => (
+            0,
+            Some(CString::new("ERR_ARTI_SHUTDOWN").unwrap()),
+            Some(CString::new("native result construction panicked").unwrap()),
+        ),
     };
     let result = BareArtiResult {
         generation,
@@ -128,30 +136,10 @@ fn invoke(
         error_code: code.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
         error_message: message.as_ref().map_or(ptr::null(), |value| value.as_ptr()),
     };
+    // The callback owns its context after acceptance and MUST NOT unwind. It is
+    // deliberately invoked once, outside catch_unwind: retrying after a foreign
+    // callback starts would double-consume that context.
     unsafe { callback(context as *mut c_void, &result) };
-}
-
-fn invoke_safely(
-    callback: unsafe extern "C" fn(*mut c_void, *const BareArtiResult),
-    context: usize,
-    event: ServiceEvent,
-) {
-    let generation = match &event {
-        ServiceEvent::Running { generation, .. }
-        | ServiceEvent::Failed { generation, .. }
-        | ServiceEvent::Stopped { generation } => *generation,
-    };
-    if catch_unwind(AssertUnwindSafe(|| invoke(callback, context, event))).is_err() {
-        static CODE: &[u8] = b"ERR_ARTI_SHUTDOWN\0";
-        static MESSAGE: &[u8] = b"native completion panicked\0";
-        let result = BareArtiResult {
-            generation,
-            port: 0,
-            error_code: CODE.as_ptr().cast(),
-            error_message: MESSAGE.as_ptr().cast(),
-        };
-        unsafe { callback(context as *mut c_void, &result) };
-    }
 }
 
 fn start_impl(
@@ -182,11 +170,11 @@ fn start_impl(
     let completion = Box::new(move |event: ServiceEvent| {
         if let Ok(mut state) = service.requests.lock() {
             state.start_pending = false;
-            if matches!(event, ServiceEvent::Failed { .. }) {
+            if matches!(event, ServiceEvent::Failed { .. }) && !state.stop_pending {
                 state.active_generation = None;
             }
         }
-        invoke_safely(callback, context, event);
+        invoke_once(callback, context, event);
     });
     match service.controller.start(options, completion) {
         Ok(()) => BARE_ARTI_STATUS_OK,
@@ -228,7 +216,7 @@ fn stop_impl(generation: u64, callback: BareArtiCompletion, context: *mut c_void
                 state.stop_pending = false;
             }
         }
-        invoke_safely(callback, context, event);
+        invoke_once(callback, context, event);
     });
     match service.controller.stop(generation, completion) {
         Ok(()) => BARE_ARTI_STATUS_OK,
@@ -242,7 +230,16 @@ fn stop_impl(generation: u64, callback: BareArtiCompletion, context: *mut c_void
 }
 
 #[no_mangle]
-pub extern "C" fn bare_arti_start(
+/// Starts the process-wide Arti service asynchronously.
+///
+/// # Safety
+///
+/// `options` must point to a readable `BareArtiOptions`; its `data_dir` must be
+/// a valid NUL-terminated string for this call. For an accepted request,
+/// `context` must remain valid until `callback` consumes it on an arbitrary
+/// native completion thread. The callback must not unwind. A rejected request
+/// never invokes the callback, so the caller retains ownership of `context`.
+pub unsafe extern "C" fn bare_arti_start(
     options: *const BareArtiOptions,
     callback: BareArtiCompletion,
     context: *mut c_void,
@@ -252,7 +249,15 @@ pub extern "C" fn bare_arti_start(
 }
 
 #[no_mangle]
-pub extern "C" fn bare_arti_stop(
+/// Stops the active Arti generation asynchronously.
+///
+/// # Safety
+///
+/// For an accepted request, `context` must remain valid until `callback`
+/// consumes it on an arbitrary native completion thread. The callback must not
+/// unwind. A rejected request never invokes the callback, so the caller retains
+/// ownership of `context`.
+pub unsafe extern "C" fn bare_arti_stop(
     generation: u64,
     callback: BareArtiCompletion,
     context: *mut c_void,
@@ -277,6 +282,10 @@ impl bare_arti::service::WorkerFactory for TestWorkerFactory {
         std::thread::Builder::new()
             .name("bare-arti-abi-test-worker".into())
             .spawn(move || {
+                if options.data_dir.to_string_lossy().contains("delay-start") {
+                    let _ = cancel.blocking_recv();
+                    return Ok(());
+                }
                 if options
                     .data_dir
                     .to_string_lossy()
@@ -319,7 +328,7 @@ mod tests {
     }
 
     unsafe extern "C" fn collect(context: *mut c_void, result: *const BareArtiResult) {
-        let sender = &*(context as *const mpsc::Sender<OwnedResult>);
+        let sender = Box::from_raw(context as *mut mpsc::Sender<OwnedResult>);
         let result = &*result;
         let copy = |value: *const c_char| {
             (!value.is_null()).then(|| CStr::from_ptr(value).to_string_lossy().into_owned())
@@ -333,6 +342,26 @@ mod tests {
                 callback_thread: std::thread::current().id(),
             })
             .unwrap();
+    }
+
+    fn callback_context(sender: &mpsc::Sender<OwnedResult>) -> *mut c_void {
+        Box::into_raw(Box::new(sender.clone())).cast()
+    }
+
+    unsafe fn reclaim_rejected_context(context: *mut c_void) {
+        drop(Box::from_raw(context as *mut mpsc::Sender<OwnedResult>));
+    }
+
+    fn call_start(
+        options: *const BareArtiOptions,
+        callback: BareArtiCompletion,
+        context: *mut c_void,
+    ) -> i32 {
+        unsafe { bare_arti_start(options, callback, context) }
+    }
+
+    fn call_stop(generation: u64, callback: BareArtiCompletion, context: *mut c_void) -> i32 {
+        unsafe { bare_arti_stop(generation, callback, context) }
     }
 
     fn options(path: &CString, generation: u64) -> BareArtiOptions {
@@ -365,48 +394,48 @@ mod tests {
     fn rejects_invalid_pointers_values_and_missing_callbacks_synchronously() {
         let path = CString::new("/private/arti").unwrap();
         assert_eq!(
-            bare_arti_start(std::ptr::null(), Some(collect), std::ptr::null_mut()),
+            call_start(std::ptr::null(), Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         let mut raw = options(&path, 1);
         raw.data_dir = std::ptr::null();
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), std::ptr::null_mut()),
+            call_start(&raw, Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         raw = options(&path, 0);
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), std::ptr::null_mut()),
+            call_start(&raw, Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         raw = options(&path, u64::MAX);
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), std::ptr::null_mut()),
+            call_start(&raw, Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         raw = options(&path, 1);
         raw.timeout_ms = MIN_TIMEOUT_MS - 1;
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), std::ptr::null_mut()),
+            call_start(&raw, Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         let relative = CString::new("relative/arti").unwrap();
         raw = options(&relative, 1);
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), std::ptr::null_mut()),
+            call_start(&raw, Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         raw = options(&path, 1);
         assert_eq!(
-            bare_arti_start(&raw, None, std::ptr::null_mut()),
+            call_start(&raw, None, std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         assert_eq!(
-            bare_arti_stop(0, Some(collect), std::ptr::null_mut()),
+            call_stop(0, Some(collect), std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
         assert_eq!(
-            bare_arti_stop(1, None, std::ptr::null_mut()),
+            call_stop(1, None, std::ptr::null_mut()),
             BARE_ARTI_STATUS_INVALID
         );
     }
@@ -417,12 +446,10 @@ mod tests {
         let generation = next_generation();
         let path = CString::new("/private/arti").unwrap();
         let (sender, receiver) = mpsc::channel::<OwnedResult>();
-        let context = (&sender as *const mpsc::Sender<OwnedResult>)
-            .cast_mut()
-            .cast();
+        let start_context = callback_context(&sender);
         let caller_thread = std::thread::current().id();
         assert_eq!(
-            bare_arti_start(&options(&path, generation), Some(collect), context),
+            call_start(&options(&path, generation), Some(collect), start_context,),
             BARE_ARTI_STATUS_OK
         );
         let started = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -432,8 +459,9 @@ mod tests {
         assert_eq!(started.message, None);
         assert_ne!(started.callback_thread, caller_thread);
         assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        let stop_context = callback_context(&sender);
         assert_eq!(
-            bare_arti_stop(generation, Some(collect), context),
+            call_stop(generation, Some(collect), stop_context),
             BARE_ARTI_STATUS_OK
         );
         let stopped = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -451,22 +479,23 @@ mod tests {
         let generation = next_generation();
         let path = CString::new("/private/arti").unwrap();
         let (sender, receiver) = mpsc::channel::<OwnedResult>();
-        let context = (&sender as *const mpsc::Sender<OwnedResult>)
-            .cast_mut()
-            .cast();
         let raw = options(&path, generation);
+        let accepted_context = callback_context(&sender);
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), context),
+            call_start(&raw, Some(collect), accepted_context),
             BARE_ARTI_STATUS_OK
         );
+        let rejected_context = callback_context(&sender);
         assert_eq!(
-            bare_arti_start(&raw, Some(collect), context),
+            call_start(&raw, Some(collect), rejected_context),
             BARE_ARTI_STATUS_REJECTED
         );
+        unsafe { reclaim_rejected_context(rejected_context) };
         let _ = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        let stop_context = callback_context(&sender);
         assert_eq!(
-            bare_arti_stop(generation, Some(collect), context),
+            call_stop(generation, Some(collect), stop_context),
             BARE_ARTI_STATUS_OK
         );
         let _ = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -478,11 +507,9 @@ mod tests {
         let generation = next_generation();
         let path = CString::new("/private/fail-bootstrap").unwrap();
         let (sender, receiver) = mpsc::channel::<OwnedResult>();
-        let context = (&sender as *const mpsc::Sender<OwnedResult>)
-            .cast_mut()
-            .cast();
+        let context = callback_context(&sender);
         assert_eq!(
-            bare_arti_start(&options(&path, generation), Some(collect), context),
+            call_start(&options(&path, generation), Some(collect), context),
             BARE_ARTI_STATUS_OK
         );
         let result = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -490,5 +517,64 @@ mod tests {
         assert_eq!(result.port, 0);
         assert_eq!(result.code.as_deref(), Some("ERR_ARTI_BOOTSTRAP"));
         assert!(result.message.unwrap().contains("test bootstrap failure"));
+    }
+
+    #[test]
+    fn stop_while_starting_completes_both_requests_and_allows_restart() {
+        let _serial = ABI_TEST.lock().unwrap();
+        let generation = next_generation();
+        let path = CString::new("/private/delay-start").unwrap();
+        let (sender, receiver) = mpsc::channel::<OwnedResult>();
+
+        let start_context = callback_context(&sender);
+        assert_eq!(
+            call_start(&options(&path, generation), Some(collect), start_context,),
+            BARE_ARTI_STATUS_OK
+        );
+        let stop_context = callback_context(&sender);
+        assert_eq!(
+            call_stop(generation, Some(collect), stop_context),
+            BARE_ARTI_STATUS_OK
+        );
+
+        let first = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(first.generation, generation);
+        assert_eq!(second.generation, generation);
+        assert_eq!(first.code.as_deref(), Some("ERR_ARTI_CANCELLED"));
+        assert_eq!(second.code, None);
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+
+        let restart_generation = next_generation();
+        let restart_path = CString::new("/private/arti").unwrap();
+        let restart_context = callback_context(&sender);
+        assert_eq!(
+            call_start(
+                &options(&restart_path, restart_generation),
+                Some(collect),
+                restart_context,
+            ),
+            BARE_ARTI_STATUS_OK
+        );
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .generation,
+            restart_generation
+        );
+        let restart_stop_context = callback_context(&sender);
+        assert_eq!(
+            call_stop(restart_generation, Some(collect), restart_stop_context,),
+            BARE_ARTI_STATUS_OK
+        );
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .generation,
+            restart_generation
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
     }
 }
