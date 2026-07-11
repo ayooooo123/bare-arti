@@ -625,6 +625,165 @@ for (const nativeCompletion of ['resolve', 'reject']) {
   })
 }
 
+for (const stopFailure of ['synchronous', 'asynchronous']) {
+  test(`unknown ${stopFailure} native stop failure is terminal shutdown`, async (t) => {
+    const nativeStart = deferred()
+    const original = new Error(`${stopFailure} stop failure`)
+    let startCalls = 0
+    let stopCalls = 0
+    const controller = createAddonController(
+      controllerOptions(
+        {
+          start() {
+            startCalls++
+            return nativeStart.promise
+          },
+          stop() {
+            stopCalls++
+            if (stopFailure === 'synchronous') throw original
+            return Promise.reject(original)
+          }
+        },
+        { setTimer: () => 1, clearTimer() {} }
+      )
+    )
+    const starting = controller.start({ dataDir: '/private/a' })
+    const startingOutcome = rejection(starting)
+    const stoppingOutcome = rejection(controller.stop())
+    const stopError = await stoppingOutcome
+    const startError = await startingOutcome
+
+    t.is(stopError.code, 'ERR_ARTI_SHUTDOWN', 'stop rejects shutdown')
+    t.is(stopError.cause, original, 'stop preserves the original cause')
+    t.is(startError, stopError, 'in-flight start shares terminal shutdown error')
+
+    const laterStart = controller.start({ dataDir: '/private/a' })
+    nativeStart.resolve({ port: 19050 })
+    const laterStartError = await rejection(laterStart)
+    t.is(laterStartError && laterStartError.code, 'ERR_ARTI_SHUTDOWN')
+    const laterStopError = await rejection(controller.stop())
+    t.is(laterStopError && laterStopError.code, 'ERR_ARTI_SHUTDOWN')
+    t.is(startCalls, 1, 'does not start native again')
+    t.is(stopCalls, 1, 'does not stop native again')
+  })
+}
+
+test('documented non-shutdown native stop failure maps to shutdown', async (t) => {
+  const bind = artiError('ERR_ARTI_BIND', 'inappropriate stop code')
+  const controller = createAddonController(
+    controllerOptions({
+      start: async () => ({ port: 19050 }),
+      stop: () => Promise.reject(bind)
+    })
+  )
+  const handle = await controller.start({ dataDir: '/private/a' })
+  const error = await rejection(handle.stop())
+
+  t.is(error.code, 'ERR_ARTI_SHUTDOWN')
+  t.is(error.cause, bind)
+})
+
+test('malformed native port rejects bootstrap and permits restart after stop', async (t) => {
+  let startCalls = 0
+  let stopCalls = 0
+  const controller = createAddonController(
+    controllerOptions({
+      async start() {
+        startCalls++
+        return startCalls === 1 ? { port: 0 } : { port: 19050 }
+      },
+      async stop() {
+        stopCalls++
+      }
+    })
+  )
+  const malformed = await rejection(controller.start({ dataDir: '/private/a' }))
+
+  t.is(malformed && malformed.code, 'ERR_ARTI_BOOTSTRAP')
+  t.is(stopCalls, 1, 'stops the malformed native service')
+  t.is((await controller.start({ dataDir: '/private/a' })).port, 19050)
+  t.is(startCalls, 2, 'returns to stopped before restart')
+})
+
+test('native port must be an integer from 1 through 65535', async (t) => {
+  for (const port of [undefined, 0, 65536, 1.5, '9050']) {
+    const controller = createAddonController(
+      controllerOptions({
+        start: async () => ({ port }),
+        stop: async () => {}
+      })
+    )
+
+    const error = await rejection(controller.start({ dataDir: `/private/${port}` }))
+    t.is(error && error.code, 'ERR_ARTI_BOOTSTRAP', `rejects ${port}`)
+  }
+
+  for (const port of [1, 65535]) {
+    const controller = createAddonController(
+      controllerOptions({ start: async () => ({ port }), stop: t.fail })
+    )
+    t.is((await controller.start({ dataDir: `/private/${port}` })).port, port)
+  }
+})
+
+test('synchronous timer failure stops native before rejecting startup', async (t) => {
+  const firstNativeStart = deferred()
+  const nativeStop = deferred()
+  const timerFailure = new Error('timer setup failed')
+  let startCalls = 0
+  let stopCalls = 0
+  let timerCalls = 0
+  const controller = createAddonController(
+    controllerOptions(
+      {
+        start() {
+          startCalls++
+          return startCalls === 1 ? firstNativeStart.promise : Promise.resolve({ port: 19051 })
+        },
+        stop() {
+          stopCalls++
+          return nativeStop.promise
+        }
+      },
+      {
+        setTimer() {
+          timerCalls++
+          if (timerCalls === 1) throw timerFailure
+          return 2
+        },
+        clearTimer() {}
+      }
+    )
+  )
+
+  let starting
+  const thrown = captureError(() => {
+    starting = controller.start({ dataDir: '/private/a' })
+  })
+  t.is(thrown, null, 'public start does not throw')
+  if (thrown) {
+    firstNativeStart.resolve({ port: 19050 })
+    return
+  }
+  t.ok(starting instanceof Promise, 'returns the stored startup promise')
+  t.is(stopCalls, 1, 'requests native stop')
+
+  const startingOutcome = rejection(starting)
+  let settled = false
+  startingOutcome.then(() => (settled = true))
+  firstNativeStart.resolve({ port: 19050 })
+  await Promise.resolve()
+  await Promise.resolve()
+  t.is(settled, false, 'waits for native stop settlement')
+
+  nativeStop.resolve()
+  const error = await startingOutcome
+  t.is(error.code, 'ERR_ARTI_BOOTSTRAP')
+  t.is(error.cause, timerFailure)
+  t.is((await controller.start({ dataDir: '/private/a' })).port, 19051)
+  t.is(startCalls, 2, 'restarts only after stop')
+})
+
 test('documented native errors are preserved and unknown failures map to bootstrap', async (t) => {
   const documented = artiError('ERR_ARTI_BIND', 'bind failed')
   const documentedController = createAddonController(
