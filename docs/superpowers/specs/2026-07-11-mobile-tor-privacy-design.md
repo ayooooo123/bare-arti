@@ -111,18 +111,18 @@ Contract rules:
 
 Errors expose a stable `code` property:
 
-| Code | Meaning | Retryable after returning to `Stopped` |
-| --- | --- | --- |
-| `ERR_ARTI_UNSUPPORTED_PLATFORM` | No supported backend for this target | No |
-| `ERR_ARTI_ADDON_MISSING` | Required mobile addon prebuild cannot load | No |
-| `ERR_ARTI_CONFIG_CONFLICT` | Concurrent start options differ | Yes, after stop |
-| `ERR_ARTI_REALM_CONFLICT` | Another Bare realm owns process-wide Arti | No in that process |
-| `ERR_ARTI_CONFIG` | Data directory or timeout is invalid | Yes with corrected options |
-| `ERR_ARTI_CANCELLED` | Stop or realm teardown cancelled startup | Yes |
-| `ERR_ARTI_TIMEOUT` | Bootstrap exceeded the configured timeout | Yes |
-| `ERR_ARTI_BOOTSTRAP` | Arti could not bootstrap | Yes |
-| `ERR_ARTI_BIND` | Loopback SOCKS listener could not bind | Yes |
-| `ERR_ARTI_SHUTDOWN` | Native worker did not terminate cleanly | No automatic retry |
+| Code                            | Meaning                                    | Retryable after returning to `Stopped` |
+| ------------------------------- | ------------------------------------------ | -------------------------------------- |
+| `ERR_ARTI_UNSUPPORTED_PLATFORM` | No supported backend for this target       | No                                     |
+| `ERR_ARTI_ADDON_MISSING`        | Required mobile addon prebuild cannot load | No                                     |
+| `ERR_ARTI_CONFIG_CONFLICT`      | Concurrent start options differ            | Yes, after stop                        |
+| `ERR_ARTI_REALM_CONFLICT`       | Another Bare realm owns process-wide Arti  | No in that process                     |
+| `ERR_ARTI_CONFIG`               | Data directory or timeout is invalid       | Yes with corrected options             |
+| `ERR_ARTI_CANCELLED`            | Stop or realm teardown cancelled startup   | Yes                                    |
+| `ERR_ARTI_TIMEOUT`              | Bootstrap exceeded the configured timeout  | Yes                                    |
+| `ERR_ARTI_BOOTSTRAP`            | Arti could not bootstrap                   | Yes                                    |
+| `ERR_ARTI_BIND`                 | Loopback SOCKS listener could not bind     | Yes                                    |
+| `ERR_ARTI_SHUTDOWN`             | Native worker did not terminate cleanly    | No automatic retry                     |
 
 Every failure leaves the process in `Stopped`, except `ERR_ARTI_SHUTDOWN`, which
 leaves it in a terminal `Failed` state until process restart. PearTube remains
@@ -154,20 +154,20 @@ Stopped -> Starting -> Running
 An unrecoverable join/shutdown failure transitions to `Failed`. Operation rules
 are deterministic:
 
-| Current state | Operation | Result |
-| --- | --- | --- |
-| `Stopped` | `start(A)` | Create generation N and enter `Starting(A)` |
-| `Starting(A)` | `start(A)` | Share generation N promise |
-| `Starting(A)` | `start(B)` | Reject `ERR_ARTI_CONFIG_CONFLICT` |
-| `Starting` | `stop(N)` or timeout | Cancel, join, reject starts, enter `Stopped` |
-| `Running(A)` | `start(A)` | Return generation N service |
-| `Running(A)` | `start(B)` | Reject `ERR_ARTI_CONFIG_CONFLICT` |
-| `Running` | `stop(N)` | Stop and join, enter `Stopped` |
-| `Stopping` | `start()` | Reject `ERR_ARTI_CANCELLED`; caller retries after stop |
-| any newer generation | `stop(old N)` | Resolve without changing state |
-| failed bootstrap | completion | Reject once and enter `Stopped` |
-| cancelled generation | late completion | Discard and free result |
-| `Failed` | any operation | Reject `ERR_ARTI_SHUTDOWN` |
+| Current state        | Operation            | Result                                                 |
+| -------------------- | -------------------- | ------------------------------------------------------ |
+| `Stopped`            | `start(A)`           | Create generation N and enter `Starting(A)`            |
+| `Starting(A)`        | `start(A)`           | Share generation N promise                             |
+| `Starting(A)`        | `start(B)`           | Reject `ERR_ARTI_CONFIG_CONFLICT`                      |
+| `Starting`           | `stop(N)` or timeout | Cancel, join, reject starts, enter `Stopped`           |
+| `Running(A)`         | `start(A)`           | Return generation N service                            |
+| `Running(A)`         | `start(B)`           | Reject `ERR_ARTI_CONFIG_CONFLICT`                      |
+| `Running`            | `stop(N)`            | Stop and join, enter `Stopped`                         |
+| `Stopping`           | `start()`            | Reject `ERR_ARTI_CANCELLED`; caller retries after stop |
+| any newer generation | `stop(old N)`        | Resolve without changing state                         |
+| failed bootstrap     | completion           | Reject once and enter `Stopped`                        |
+| cancelled generation | late completion      | Discard and free result                                |
+| `Failed`             | any operation        | Reject `ERR_ARTI_SHUTDOWN`                             |
 
 ### Realm ownership
 
