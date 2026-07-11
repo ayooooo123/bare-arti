@@ -1,6 +1,8 @@
 use std::fmt;
+use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -65,6 +67,324 @@ pub trait WorkerFactory: Send + Sync {
         cancel: oneshot::Receiver<()>,
         ready: mpsc::SyncSender<Result<u16, ServiceError>>,
     ) -> Result<WorkerHandle, ServiceError>;
+}
+
+pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub trait ManagedSocksService: Send {
+    fn port(&self) -> u16;
+    fn wait(&mut self) -> ServiceFuture<'_, Result<(), ServiceError>>;
+    fn shutdown(self: Box<Self>) -> ServiceFuture<'static, Result<(), ServiceError>>;
+}
+
+type BootstrapHook<C> =
+    dyn Fn(PathBuf) -> ServiceFuture<'static, Result<C, ServiceError>> + Send + Sync;
+type BindAndServeHook<C> = dyn Fn(C) -> ServiceFuture<'static, Result<Box<dyn ManagedSocksService>, ServiceError>>
+    + Send
+    + Sync;
+
+pub struct ProductionWorkerFactory<C> {
+    bootstrap: Arc<BootstrapHook<C>>,
+    bind_and_serve: Arc<BindAndServeHook<C>>,
+}
+
+impl<C> ProductionWorkerFactory<C>
+where
+    C: Send + 'static,
+{
+    pub fn with_hooks<B, S>(bootstrap: B, bind_and_serve: S) -> Self
+    where
+        B: Fn(PathBuf) -> ServiceFuture<'static, Result<C, ServiceError>> + Send + Sync + 'static,
+        S: Fn(C) -> ServiceFuture<'static, Result<Box<dyn ManagedSocksService>, ServiceError>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            bootstrap: Arc::new(bootstrap),
+            bind_and_serve: Arc::new(bind_and_serve),
+        }
+    }
+}
+
+impl ManagedSocksService for crate::SocksService {
+    fn port(&self) -> u16 {
+        self.port()
+    }
+
+    fn wait(&mut self) -> ServiceFuture<'_, Result<(), ServiceError>> {
+        Box::pin(async move {
+            self.wait().await.map_err(|error| {
+                ServiceError::new(
+                    "ERR_ARTI_SHUTDOWN",
+                    format!("SOCKS service failed: {error}"),
+                )
+            })
+        })
+    }
+
+    fn shutdown(self: Box<Self>) -> ServiceFuture<'static, Result<(), ServiceError>> {
+        Box::pin(async move {
+            (*self).shutdown().await.map_err(|error| {
+                ServiceError::new(
+                    "ERR_ARTI_SHUTDOWN",
+                    format!("could not stop SOCKS service: {error}"),
+                )
+            })
+        })
+    }
+}
+
+pub fn production_worker_factory() -> Arc<dyn WorkerFactory> {
+    Arc::new(ProductionWorkerFactory::with_hooks(
+        |data_dir: PathBuf| {
+            Box::pin(async move {
+                let data_dir = data_dir.to_str().ok_or_else(|| {
+                    ServiceError::new("ERR_ARTI_CONFIG", "dataDir must contain valid UTF-8")
+                })?;
+                crate::bootstrap_in(data_dir)
+                    .await
+                    .map_err(|error| ServiceError::new("ERR_ARTI_BOOTSTRAP", error.to_string()))
+            })
+        },
+        |client| {
+            Box::pin(async move {
+                let (_port, service) = crate::serve_socks(client, "127.0.0.1")
+                    .await
+                    .map_err(|error| ServiceError::new("ERR_ARTI_BIND", error.to_string()))?;
+                Ok(Box::new(service) as Box<dyn ManagedSocksService>)
+            })
+        },
+    ))
+}
+
+impl<C> WorkerFactory for ProductionWorkerFactory<C>
+where
+    C: Send + 'static,
+{
+    fn spawn(
+        &self,
+        options: ServiceOptions,
+        cancel: oneshot::Receiver<()>,
+        ready: mpsc::SyncSender<Result<u16, ServiceError>>,
+    ) -> Result<WorkerHandle, ServiceError> {
+        let bootstrap = self.bootstrap.clone();
+        let bind_and_serve = self.bind_and_serve.clone();
+        thread::Builder::new()
+            .name("bare-arti-native-worker".into())
+            .spawn(move || run_production_worker(options, cancel, ready, bootstrap, bind_and_serve))
+            .map_err(|error| {
+                ServiceError::new(
+                    "ERR_ARTI_BOOTSTRAP",
+                    format!("could not create native Arti worker: {error}"),
+                )
+            })
+    }
+}
+
+fn run_production_worker<C>(
+    options: ServiceOptions,
+    mut cancel: oneshot::Receiver<()>,
+    ready: mpsc::SyncSender<Result<u16, ServiceError>>,
+    bootstrap: Arc<BootstrapHook<C>>,
+    bind_and_serve: Arc<BindAndServeHook<C>>,
+) -> WorkerResult
+where
+    C: Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            ServiceError::new(
+                "ERR_ARTI_BOOTSTRAP",
+                format!("could not create Tokio runtime: {error}"),
+            )
+        })?;
+
+    runtime.block_on(async move {
+        let data_dir = match prepare_data_dir(&options.data_dir) {
+            Ok(data_dir) => data_dir,
+            Err(error) => {
+                let _ = ready.send(Err(error.clone()));
+                return Err(error);
+            }
+        };
+        let client = tokio::select! {
+            biased;
+            _ = &mut cancel => {
+                let error = cancelled_error();
+                let _ = ready.send(Err(error.clone()));
+                return Err(error);
+            }
+            result = bootstrap(data_dir) => match result {
+                Ok(client) => client,
+                Err(error) => {
+                    let error = normalize_worker_error("ERR_ARTI_BOOTSTRAP", "Arti bootstrap failed", error);
+                    let _ = ready.send(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        };
+        let mut service = tokio::select! {
+            biased;
+            _ = &mut cancel => {
+                let error = cancelled_error();
+                let _ = ready.send(Err(error.clone()));
+                return Err(error);
+            }
+            result = bind_and_serve(client) => match result {
+                Ok(service) => service,
+                Err(error) => {
+                    let error = normalize_worker_error("ERR_ARTI_BIND", "could not bind loopback SOCKS service", error);
+                    let _ = ready.send(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        };
+        let port = service.port();
+        if port == 0 {
+            let error = ServiceError::new("ERR_ARTI_BIND", "SOCKS service returned an invalid port");
+            let _ = ready.send(Err(error.clone()));
+            let _ = service.shutdown().await;
+            return Err(error);
+        }
+        if ready.send(Ok(port)).is_err() {
+            return service.shutdown().await;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut cancel => service.shutdown().await,
+            result = service.wait() => {
+                let result = result.map_err(|error| {
+                    normalize_worker_error("ERR_ARTI_SHUTDOWN", "SOCKS service failed", error)
+                });
+                let shutdown = service.shutdown().await;
+                match (result, shutdown) {
+                    (Err(error), _) => Err(error),
+                    (Ok(()), Err(error)) => Err(error),
+                    (Ok(()), Ok(())) => Err(ServiceError::new(
+                        "ERR_ARTI_SHUTDOWN",
+                        "SOCKS service exited unexpectedly",
+                    )),
+                }
+            }
+        }
+    })
+}
+
+fn normalize_worker_error(
+    code: &'static str,
+    context: &'static str,
+    error: ServiceError,
+) -> ServiceError {
+    if error.code == code {
+        error
+    } else {
+        ServiceError::new(
+            code,
+            format!("{context}: {}: {}", error.code, error.message),
+        )
+    }
+}
+
+fn prepare_data_dir(data_dir: &std::path::Path) -> Result<PathBuf, ServiceError> {
+    if !data_dir.is_absolute() {
+        return Err(ServiceError::new(
+            "ERR_ARTI_CONFIG",
+            "dataDir must be an absolute path",
+        ));
+    }
+    let existed = data_dir.exists();
+    std::fs::create_dir_all(data_dir).map_err(|error| {
+        ServiceError::new(
+            "ERR_ARTI_CONFIG",
+            format!("could not create dataDir: {error}"),
+        )
+    })?;
+    if !existed {
+        set_owner_only_permissions(data_dir)?;
+    }
+    let first = std::fs::symlink_metadata(data_dir).map_err(config_fs_error)?;
+    if first.file_type().is_symlink() || !first.is_dir() {
+        return Err(ServiceError::new(
+            "ERR_ARTI_CONFIG",
+            "dataDir must be a directory and not a symbolic link",
+        ));
+    }
+    ensure_owner_only_permissions(&first)?;
+    let canonical = std::fs::canonicalize(data_dir).map_err(config_fs_error)?;
+    let canonical_metadata = std::fs::metadata(&canonical).map_err(config_fs_error)?;
+    let final_metadata = std::fs::symlink_metadata(data_dir).map_err(config_fs_error)?;
+    if final_metadata.file_type().is_symlink()
+        || !same_file(&first, &canonical_metadata)
+        || !same_file(&canonical_metadata, &final_metadata)
+    {
+        return Err(ServiceError::new(
+            "ERR_ARTI_CONFIG",
+            "dataDir changed during native validation",
+        ));
+    }
+    Ok(canonical)
+}
+
+fn config_fs_error(error: std::io::Error) -> ServiceError {
+    ServiceError::new(
+        "ERR_ARTI_CONFIG",
+        format!("could not validate dataDir: {error}"),
+    )
+}
+
+#[cfg(unix)]
+fn set_owner_only_permissions(data_dir: &std::path::Path) -> Result<(), ServiceError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(config_fs_error)
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_permissions(_data_dir: &std::path::Path) -> Result<(), ServiceError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_owner_only_permissions(metadata: &std::fs::Metadata) -> Result<(), ServiceError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(ServiceError::new(
+            "ERR_ARTI_CONFIG",
+            "dataDir must not be accessible by group or other users",
+        ));
+    }
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes no arguments, has no side effects, and is provided
+    // by every Unix target supported by this crate (including Android/iOS).
+    if metadata.uid() != unsafe { geteuid() } {
+        return Err(ServiceError::new(
+            "ERR_ARTI_CONFIG",
+            "dataDir must be owned by the current user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_permissions(_metadata: &std::fs::Metadata) -> Result<(), ServiceError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1273,6 +1593,243 @@ mod tests {
     use std::time::Duration;
 
     use tokio::sync::oneshot;
+
+    struct ControlledSocksService {
+        port: u16,
+        running: Option<oneshot::Receiver<()>>,
+        accept_closed: mpsc::SyncSender<()>,
+        connections_aborted: mpsc::SyncSender<()>,
+        connections_joined: mpsc::SyncSender<()>,
+        allow_join: mpsc::Receiver<()>,
+    }
+
+    impl ManagedSocksService for ControlledSocksService {
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        fn wait(&mut self) -> ServiceFuture<'_, Result<(), ServiceError>> {
+            let running = self.running.as_mut().expect("service wait is called once");
+            Box::pin(async move {
+                let _ = running.await;
+                Ok(())
+            })
+        }
+
+        fn shutdown(self: Box<Self>) -> ServiceFuture<'static, Result<(), ServiceError>> {
+            Box::pin(async move {
+                self.accept_closed
+                    .send(())
+                    .map_err(|error| ServiceError::new("ERR_ARTI_SHUTDOWN", error.to_string()))?;
+                self.connections_aborted
+                    .send(())
+                    .map_err(|error| ServiceError::new("ERR_ARTI_SHUTDOWN", error.to_string()))?;
+                tokio::task::block_in_place(|| self.allow_join.recv())
+                    .map_err(|error| ServiceError::new("ERR_ARTI_SHUTDOWN", error.to_string()))?;
+                self.connections_joined
+                    .send(())
+                    .map_err(|error| ServiceError::new("ERR_ARTI_SHUTDOWN", error.to_string()))?;
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn worker_reports_loopback_port_and_joins_service_before_success() {
+        let (bootstrapped_tx, bootstrapped) = mpsc::sync_channel(0);
+        let bootstrap = move |_data_dir: PathBuf| {
+            let bootstrapped_tx = bootstrapped_tx.clone();
+            Box::pin(async move {
+                bootstrapped_tx.send(()).unwrap();
+                Ok(())
+            }) as ServiceFuture<'static, Result<(), ServiceError>>
+        };
+        let (_running_tx, running) = oneshot::channel();
+        let (accept_closed_tx, accept_closed) = mpsc::sync_channel(0);
+        let (connections_aborted_tx, connections_aborted) = mpsc::sync_channel(0);
+        let (connections_joined_tx, connections_joined) = mpsc::sync_channel(0);
+        let (allow_join_tx, allow_join) = mpsc::sync_channel(0);
+        let bind = Arc::new(Mutex::new(Some((
+            running,
+            accept_closed_tx,
+            connections_aborted_tx,
+            connections_joined_tx,
+            allow_join,
+        ))));
+        let bind_and_serve = move |()| {
+            let (running, accept_closed, connections_aborted, connections_joined, allow_join) =
+                bind.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                Ok(Box::new(ControlledSocksService {
+                    port: 19050,
+                    running: Some(running),
+                    accept_closed,
+                    connections_aborted,
+                    connections_joined,
+                    allow_join,
+                }) as Box<dyn ManagedSocksService>)
+            })
+                as ServiceFuture<'static, Result<Box<dyn ManagedSocksService>, ServiceError>>
+        };
+        let factory = ProductionWorkerFactory::with_hooks(bootstrap, bind_and_serve);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let data_dir = std::env::temp_dir().join(format!(
+            "bare-arti-worker-test-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let worker = factory
+            .spawn(
+                ServiceOptions {
+                    data_dir: data_dir.clone(),
+                    timeout: Duration::from_secs(60),
+                    generation: 1,
+                },
+                cancel_rx,
+                ready_tx,
+            )
+            .unwrap();
+
+        bootstrapped.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(19050)
+        );
+        assert!(
+            !worker.is_finished(),
+            "worker remains alive after readiness"
+        );
+
+        cancel_tx.send(()).unwrap();
+        accept_closed.recv_timeout(Duration::from_secs(1)).unwrap();
+        connections_aborted
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(!worker.is_finished(), "worker waits for connection joins");
+        allow_join_tx.send(()).unwrap();
+        connections_joined
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(worker.join().unwrap(), Ok(()));
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
+
+    #[test]
+    fn worker_maps_bootstrap_bind_and_cancellation_to_stable_codes() {
+        fn test_options(label: &str, generation: u64) -> ServiceOptions {
+            ServiceOptions {
+                data_dir: std::env::temp_dir().join(format!(
+                    "bare-arti-worker-{label}-{}-{:?}",
+                    std::process::id(),
+                    thread::current().id()
+                )),
+                timeout: Duration::from_secs(60),
+                generation,
+            }
+        }
+
+        let bootstrap_factory = ProductionWorkerFactory::with_hooks(
+            |_data_dir| {
+                Box::pin(async { Err(ServiceError::new("INTERNAL", "offline bootstrap failure")) })
+                    as ServiceFuture<'static, Result<(), ServiceError>>
+            },
+            |()| unreachable!(),
+        );
+        let bootstrap_options = test_options("bootstrap", 1);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = bootstrap_factory
+            .spawn(bootstrap_options.clone(), cancel_rx, ready_tx)
+            .unwrap();
+        let error = ready_rx.recv().unwrap().unwrap_err();
+        assert_eq!(error.code, "ERR_ARTI_BOOTSTRAP");
+        assert_eq!(worker.join().unwrap().unwrap_err(), error);
+        std::fs::remove_dir_all(bootstrap_options.data_dir).unwrap();
+
+        let bind_factory = ProductionWorkerFactory::with_hooks(
+            |_data_dir| {
+                Box::pin(async { Ok(()) }) as ServiceFuture<'static, Result<(), ServiceError>>
+            },
+            |()| {
+                Box::pin(async { Err(ServiceError::new("INTERNAL", "offline bind failure")) })
+                    as ServiceFuture<'static, Result<Box<dyn ManagedSocksService>, ServiceError>>
+            },
+        );
+        let bind_options = test_options("bind", 2);
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = bind_factory
+            .spawn(bind_options.clone(), cancel_rx, ready_tx)
+            .unwrap();
+        let error = ready_rx.recv().unwrap().unwrap_err();
+        assert_eq!(error.code, "ERR_ARTI_BIND");
+        assert_eq!(worker.join().unwrap().unwrap_err(), error);
+        std::fs::remove_dir_all(bind_options.data_dir).unwrap();
+
+        let cancellation_factory = ProductionWorkerFactory::with_hooks(
+            |_data_dir| {
+                Box::pin(std::future::pending()) as ServiceFuture<'static, Result<(), ServiceError>>
+            },
+            |()| unreachable!(),
+        );
+        let cancellation_options = test_options("cancel", 3);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = cancellation_factory
+            .spawn(cancellation_options.clone(), cancel_rx, ready_tx)
+            .unwrap();
+        cancel_tx.send(()).unwrap();
+        let error = ready_rx.recv().unwrap().unwrap_err();
+        assert_eq!(error.code, "ERR_ARTI_CANCELLED");
+        assert_eq!(worker.join().unwrap().unwrap_err(), error);
+        std::fs::remove_dir_all(cancellation_options.data_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_revalidates_data_dir_before_bootstrap() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!(
+            "bare-arti-native-validation-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, &link).unwrap();
+        let bootstrap_calls = Arc::new(AtomicUsize::new(0));
+        let calls = bootstrap_calls.clone();
+        let factory = ProductionWorkerFactory::with_hooks(
+            move |_data_dir| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) }) as ServiceFuture<'static, Result<(), ServiceError>>
+            },
+            |()| unreachable!(),
+        );
+        let (_cancel_tx, cancel_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let worker = factory
+            .spawn(
+                ServiceOptions {
+                    data_dir: link,
+                    timeout: Duration::from_secs(60),
+                    generation: 1,
+                },
+                cancel_rx,
+                ready_tx,
+            )
+            .unwrap();
+
+        let error = ready_rx.recv().unwrap().unwrap_err();
+        assert_eq!(error.code, "ERR_ARTI_CONFIG");
+        assert_eq!(worker.join().unwrap().unwrap_err(), error);
+        assert_eq!(bootstrap_calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     enum GateDecision {
         Ready,

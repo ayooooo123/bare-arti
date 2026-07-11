@@ -14,13 +14,18 @@
 //! glue lives in `binding.rs` and is compiled by the staticlib manifest under
 //! `addon/`.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{anyhow, Context, Result};
 use arti_client::config::{BoolOrAuto, CfgPath};
 use arti_client::{StreamPrefs, TorClient, TorClientConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio::task::{JoinHandle, JoinSet};
 use tor_rtcompat::PreferredRuntime;
 
 pub mod service;
@@ -49,7 +54,7 @@ pub async fn bootstrap_in(data_dir: &str) -> Result<Client> {
     // Ignore the error if one is already installed (idempotent across calls).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    std::fs::create_dir_all(data_dir).ok();
+    std::fs::create_dir_all(data_dir).context("creating Arti data directory")?;
 
     let mut builder = TorClientConfig::builder();
     builder
@@ -66,29 +71,117 @@ pub async fn bootstrap_in(data_dir: &str) -> Result<Client> {
 }
 
 /// Bind a localhost SOCKS5 listener and serve CONNECT requests over Tor.
-/// Returns the bound port and the accept-loop task handle.
-pub async fn serve_socks(client: Client, host: &str) -> Result<(u16, tokio::task::JoinHandle<()>)> {
+/// Returns the bound port and an owned service whose shutdown joins every task.
+pub async fn serve_socks(client: Client, host: &str) -> Result<(u16, SocksService)> {
+    serve_socks_with(host, move |sock| {
+        let client = client.clone();
+        async move {
+            // Best-effort: drop the connection on any protocol or Tor error.
+            let _ = handle_conn(client, sock).await;
+        }
+    })
+    .await
+}
+
+async fn serve_socks_with<H, F>(host: &str, handle: H) -> Result<(u16, SocksService)>
+where
+    H: Fn(TcpStream) -> F + Send + Sync + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
     let listener = TcpListener::bind((host, 0))
         .await
         .context("binding socks listener")?;
     let port = listener.local_addr()?.port();
+    let (shutdown, mut shutdown_rx) = oneshot::channel();
+    let (terminal_tx, terminal) = oneshot::channel();
+    let handle = Arc::new(handle);
 
-    let handle = tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
+    let accept_task = tokio::spawn(async move {
+        let mut connections = JoinSet::new();
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break Ok(()),
+                accepted = listener.accept() => match accepted {
                 Ok((sock, _)) => {
-                    let client = client.clone();
-                    tokio::spawn(async move {
-                        // Best-effort: drop the connection on any error.
-                        let _ = handle_conn(client, sock).await;
-                    });
+                        let handle = handle.clone();
+                        connections.spawn(async move { handle(sock).await });
                 }
-                Err(_) => break,
+                    Err(error) => break Err(anyhow!("accepting SOCKS connection: {error}")),
+                },
+                Some(_) = connections.join_next(), if !connections.is_empty() => {}
             }
-        }
+        };
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+        let _ = terminal_tx.send(());
+        outcome
     });
 
-    Ok((port, handle))
+    Ok((
+        port,
+        SocksService {
+            port,
+            shutdown: Some(shutdown),
+            terminal: Some(terminal),
+            accept_task: Some(accept_task),
+        },
+    ))
+}
+
+pub struct SocksService {
+    port: u16,
+    shutdown: Option<oneshot::Sender<()>>,
+    terminal: Option<oneshot::Receiver<()>>,
+    accept_task: Option<JoinHandle<Result<()>>>,
+}
+
+impl SocksService {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub async fn wait(&mut self) -> Result<()> {
+        let terminal = self
+            .terminal
+            .as_mut()
+            .ok_or_else(|| anyhow!("SOCKS service terminal signal is unavailable"))?;
+        terminal
+            .await
+            .map_err(|_| anyhow!("SOCKS service task ended without a terminal signal"))
+    }
+
+    pub async fn shutdown(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let task = self
+            .accept_task
+            .take()
+            .ok_or_else(|| anyhow!("SOCKS service task is unavailable"))?;
+        match task.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow!("SOCKS service shutdown failed: {error}")),
+        }
+    }
+}
+
+impl Future for SocksService {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut TaskContext<'_>) -> Poll<Self::Output> {
+        let task = match self.accept_task.as_mut() {
+            Some(task) => task,
+            None => return Poll::Ready(Err(anyhow!("SOCKS service task is unavailable"))),
+        };
+        match Pin::new(task).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(error)) => {
+                Poll::Ready(Err(anyhow!("SOCKS service task failed: {error}")))
+            }
+        }
+    }
 }
 
 async fn handle_conn(client: Client, mut sock: TcpStream) -> Result<()> {
@@ -161,4 +254,44 @@ async fn handle_conn(client: Client, mut sock: TcpStream) -> Result<()> {
 // SOCKS5 reply with the given status and a zeroed IPv4 bind address.
 fn reply(status: u8) -> [u8; 10] {
     [0x05, status, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socks_service_shutdown_aborts_and_joins_active_connections() {
+        struct Joined(mpsc::Sender<()>);
+
+        impl Drop for Joined {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (started_tx, started) = mpsc::sync_channel(0);
+        let (joined_tx, joined) = mpsc::channel();
+        let (port, service) = serve_socks_with("127.0.0.1", move |_socket| {
+            let started_tx = started_tx.clone();
+            let joined_tx = joined_tx.clone();
+            async move {
+                let _joined = Joined(joined_tx);
+                let _ = tokio::task::block_in_place(|| started_tx.send(()));
+                std::future::pending::<()>().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _connection = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::task::block_in_place(|| started.recv_timeout(Duration::from_secs(1))).unwrap();
+
+        service.shutdown().await.unwrap();
+
+        tokio::task::block_in_place(|| joined.recv_timeout(Duration::from_secs(1))).unwrap();
+        assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    }
 }
