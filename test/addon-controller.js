@@ -528,23 +528,71 @@ test('stopping blocks restart and settles only after native stop', async (t) => 
   const stopping = handle.stop()
   let stopSettled = false
   stopping.then(() => (stopSettled = true))
+  const blockedStart = controller.start({ dataDir: '/private/a' })
+  let blockedSettled = false
+  let blockedError = null
+  blockedStart.catch((error) => {
+    blockedSettled = true
+    blockedError = error
+  })
 
-  t.is(
-    (await rejection(controller.start({ dataDir: '/private/a' }))).code,
-    'ERR_ARTI_CANCELLED',
-    'rejects start while stopping'
-  )
   await Promise.resolve()
   t.is(stopSettled, false, 'stop remains pending with native')
+  t.is(blockedSettled, false, 'start remains pending with native stop')
   t.is(starts, 1, 'does not restart early')
 
   nativeStop.resolve()
   await stopping
+  await Promise.resolve()
+  t.is(blockedError.code, 'ERR_ARTI_CANCELLED', 'rejects after native stop')
   const restarted = controller.start({ dataDir: '/private/a' })
   t.is(starts, 2, 'restarts only after native stop')
   nativeStarts[1].resolve({ port: 19051 })
   t.is((await restarted).port, 19051)
 })
+
+for (const nativeCompletion of ['resolve', 'reject']) {
+  test(`native start ${nativeCompletion} during stop stays owned by stop`, async (t) => {
+    const firstNativeStart = deferred()
+    const secondNativeStart = deferred()
+    const nativeStop = deferred()
+    let startCalls = 0
+    const controller = createAddonController(
+      controllerOptions({
+        start() {
+          startCalls++
+          return startCalls === 1 ? firstNativeStart.promise : secondNativeStart.promise
+        },
+        stop: () => nativeStop.promise
+      })
+    )
+    const starting = controller.start({ dataDir: '/private/a' })
+    const startingOutcome = rejection(starting)
+    const stopping = controller.stop()
+
+    if (nativeCompletion === 'resolve') firstNativeStart.resolve({ port: 19050 })
+    else firstNativeStart.reject(new Error('late native failure'))
+
+    let startSettled = false
+    let stopSettled = false
+    startingOutcome.then(() => (startSettled = true))
+    stopping.then(() => (stopSettled = true))
+    await Promise.resolve()
+    await Promise.resolve()
+    t.is(startSettled, false, 'does not settle cancelled start early')
+    t.is(stopSettled, false, 'native stop remains the settlement owner')
+    t.is(startCalls, 1, 'does not reset or restart')
+
+    nativeStop.resolve()
+    await stopping
+    t.is((await startingOutcome).code, 'ERR_ARTI_CANCELLED')
+
+    const restarted = controller.start({ dataDir: '/private/a' })
+    t.is(startCalls, 2, 'restarts after native stop')
+    secondNativeStart.resolve({ port: 19051 })
+    t.is((await restarted).port, 19051)
+  })
+}
 
 test('documented native errors are preserved and unknown failures map to bootstrap', async (t) => {
   const documented = artiError('ERR_ARTI_BIND', 'bind failed')
