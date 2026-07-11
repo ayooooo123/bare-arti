@@ -1,4 +1,5 @@
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,7 +61,7 @@ pub trait WorkerFactory: Send + Sync {
         options: ServiceOptions,
         cancel: oneshot::Receiver<()>,
         ready: mpsc::SyncSender<Result<u16, ServiceError>>,
-    ) -> JoinHandle<Result<(), ServiceError>>;
+    ) -> Result<JoinHandle<Result<(), ServiceError>>, ServiceError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +95,94 @@ impl StartupGate for ProductionStartupGate {
     }
 }
 
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ShutdownOutcome {
+    Exited(Result<(), ServiceError>),
+    Timeout,
+}
+
+pub trait ShutdownGate: Send + Sync {
+    fn wait(
+        &self,
+        worker: JoinHandle<Result<(), ServiceError>>,
+        duration: Duration,
+    ) -> ShutdownOutcome;
+}
+
+pub struct ProductionShutdownGate;
+
+impl ShutdownGate for ProductionShutdownGate {
+    fn wait(
+        &self,
+        worker: JoinHandle<Result<(), ServiceError>>,
+        duration: Duration,
+    ) -> ShutdownOutcome {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let reaper = thread::Builder::new()
+            .name("bare-arti-worker-reaper".into())
+            .spawn(move || {
+                let result = match worker.join() {
+                    Ok(result) => result,
+                    Err(_) => Err(ServiceError::new(
+                        "ERR_ARTI_SHUTDOWN",
+                        "Arti worker thread panicked",
+                    )),
+                };
+                let _ = result_tx.send(result);
+            });
+        if reaper.is_err() {
+            return ShutdownOutcome::Timeout;
+        }
+        match result_rx.recv_timeout(duration) {
+            Ok(result) => ShutdownOutcome::Exited(result),
+            Err(_) => ShutdownOutcome::Timeout,
+        }
+    }
+}
+
+pub type SupervisorTask = Box<dyn FnOnce() + Send + 'static>;
+
+pub struct SupervisorSpawnError {
+    pub error: ServiceError,
+    pub task: SupervisorTask,
+}
+
+pub trait SupervisorSpawner: Send + Sync {
+    fn spawn(&self, task: SupervisorTask) -> Result<(), SupervisorSpawnError>;
+}
+
+pub struct ProductionSupervisorSpawner;
+
+impl SupervisorSpawner for ProductionSupervisorSpawner {
+    fn spawn(&self, task: SupervisorTask) -> Result<(), SupervisorSpawnError> {
+        let slot = Arc::new(Mutex::new(Some(task)));
+        let thread_slot = slot.clone();
+        match thread::Builder::new()
+            .name("bare-arti-service-supervisor".into())
+            .spawn(move || {
+                let task = thread_slot.lock().ok().and_then(|mut slot| slot.take());
+                if let Some(task) = task {
+                    safe_task(task);
+                }
+            }) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let task = slot
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                    .expect("supervisor task remains owned when thread creation fails");
+                Err(SupervisorSpawnError {
+                    error: ServiceError::new("ERR_ARTI_SHUTDOWN", error.to_string()),
+                    task,
+                })
+            }
+        }
+    }
+}
+
 type CancelSender = Arc<Mutex<Option<oneshot::Sender<()>>>>;
 
 struct Active {
@@ -110,6 +199,7 @@ struct Running {
 
 struct Stopping {
     generation: u64,
+    was_running: bool,
     start_completions: Vec<Completion>,
     stop_completions: Vec<Completion>,
     reason: ServiceError,
@@ -120,7 +210,7 @@ enum State {
     Starting(Active),
     Running(Running),
     Stopping(Stopping),
-    Failed,
+    Failed(ServiceError),
 }
 
 struct Inner {
@@ -132,6 +222,8 @@ struct Shared {
     inner: Mutex<Inner>,
     factory: Arc<dyn WorkerFactory>,
     gate: Arc<dyn StartupGate>,
+    shutdown_gate: Arc<dyn ShutdownGate>,
+    supervisor_spawner: Arc<dyn SupervisorSpawner>,
 }
 
 #[derive(Clone)]
@@ -141,6 +233,28 @@ pub struct ServiceController {
 
 impl ServiceController {
     pub fn new(factory: Arc<dyn WorkerFactory>, gate: Arc<dyn StartupGate>) -> Self {
+        Self::with_shutdown_gate(factory, gate, Arc::new(ProductionShutdownGate))
+    }
+
+    pub fn with_shutdown_gate(
+        factory: Arc<dyn WorkerFactory>,
+        gate: Arc<dyn StartupGate>,
+        shutdown_gate: Arc<dyn ShutdownGate>,
+    ) -> Self {
+        Self::with_dependencies(
+            factory,
+            gate,
+            shutdown_gate,
+            Arc::new(ProductionSupervisorSpawner),
+        )
+    }
+
+    fn with_dependencies(
+        factory: Arc<dyn WorkerFactory>,
+        gate: Arc<dyn StartupGate>,
+        shutdown_gate: Arc<dyn ShutdownGate>,
+        supervisor_spawner: Arc<dyn SupervisorSpawner>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 inner: Mutex::new(Inner {
@@ -149,6 +263,8 @@ impl ServiceController {
                 }),
                 factory,
                 gate,
+                shutdown_gate,
+                supervisor_spawner,
             }),
         }
     }
@@ -163,9 +279,9 @@ impl ServiceController {
         let mut start_worker = None;
 
         {
-            let mut inner = self.shared.inner.lock().unwrap();
+            let mut inner = lock_inner(&self.shared)?;
             match &mut inner.state {
-                State::Failed => return Err(shutdown_error()),
+                State::Failed(error) => return Err(error.clone()),
                 State::Stopping(_) => return Err(cancelled_error()),
                 State::Starting(active) => {
                     if active.options != options {
@@ -183,7 +299,10 @@ impl ServiceController {
                     });
                 }
                 State::Stopped => {
-                    if options.generation == 0 || options.generation <= inner.last_generation {
+                    if options.generation == 0
+                        || options.generation == u64::MAX
+                        || options.generation <= inner.last_generation
+                    {
                         return Err(generation_error(inner.last_generation, options.generation));
                     }
                     inner.last_generation = options.generation;
@@ -201,16 +320,54 @@ impl ServiceController {
         }
 
         if let Some(event) = running_event {
-            dispatch(completion.take().unwrap(), event);
+            safe_completion(completion.take().unwrap(), event);
         }
 
         if let Some((cancel, cancel_rx, ready_tx, ready_rx)) = start_worker {
-            let worker = self
-                .shared
-                .factory
-                .spawn(options.clone(), cancel_rx, ready_tx);
+            let spawned = catch_unwind(AssertUnwindSafe(|| {
+                self.shared
+                    .factory
+                    .spawn(options.clone(), cancel_rx, ready_tx)
+            }));
+            let worker = match spawned {
+                Ok(Ok(worker)) => worker,
+                Ok(Err(error)) => {
+                    finish_creation_failure(&self.shared, options.generation, error, false);
+                    return Ok(());
+                }
+                Err(_) => {
+                    finish_creation_failure(
+                        &self.shared,
+                        options.generation,
+                        ServiceError::new("ERR_ARTI_BOOTSTRAP", "worker factory panicked"),
+                        false,
+                    );
+                    return Ok(());
+                }
+            };
+            let generation = options.generation;
             let shared = self.shared.clone();
-            thread::spawn(move || supervise(shared, options, cancel, ready_rx, worker));
+            let task: SupervisorTask =
+                Box::new(move || supervise(shared, options, cancel, ready_rx, worker));
+            match catch_unwind(AssertUnwindSafe(|| {
+                self.shared.supervisor_spawner.spawn(task)
+            })) {
+                Ok(Ok(())) => {}
+                Ok(Err(failure)) => {
+                    cancel_current(&self.shared, generation);
+                    drop(failure.task);
+                    finish_creation_failure(&self.shared, generation, failure.error, true);
+                }
+                Err(_) => {
+                    cancel_current(&self.shared, generation);
+                    finish_creation_failure(
+                        &self.shared,
+                        generation,
+                        ServiceError::new("ERR_ARTI_SHUTDOWN", "supervisor spawner panicked"),
+                        true,
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -222,9 +379,9 @@ impl ServiceController {
         let mut stale = false;
 
         {
-            let mut inner = self.shared.inner.lock().unwrap();
+            let mut inner = lock_inner(&self.shared)?;
             match &mut inner.state {
-                State::Failed => return Err(shutdown_error()),
+                State::Failed(error) => return Err(error.clone()),
                 State::Stopped => {
                     if generation > inner.last_generation {
                         return Err(generation_error(inner.last_generation, generation));
@@ -244,6 +401,7 @@ impl ServiceController {
                         cancel = Some(active.cancel.clone());
                         inner.state = State::Stopping(Stopping {
                             generation,
+                            was_running: false,
                             start_completions: active.start_completions,
                             stop_completions: vec![completion.take().unwrap()],
                             reason: cancelled_error(),
@@ -263,6 +421,7 @@ impl ServiceController {
                         cancel = Some(active.cancel.clone());
                         inner.state = State::Stopping(Stopping {
                             generation,
+                            was_running: true,
                             start_completions: Vec::new(),
                             stop_completions: vec![completion.take().unwrap()],
                             reason: cancelled_error(),
@@ -285,7 +444,7 @@ impl ServiceController {
             cancel_once(&cancel);
         }
         if stale {
-            dispatch(
+            safe_completion(
                 completion.take().unwrap(),
                 ServiceEvent::Stopped { generation },
             );
@@ -301,7 +460,21 @@ fn supervise(
     ready: mpsc::Receiver<Result<u16, ServiceError>>,
     worker: JoinHandle<Result<(), ServiceError>>,
 ) {
-    let outcome = shared.gate.wait(ready, options.timeout);
+    let outcome = match catch_unwind(AssertUnwindSafe(|| {
+        shared.gate.wait(ready, options.timeout)
+    })) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            stop_after_startup(
+                &shared,
+                options.generation,
+                &cancel,
+                worker,
+                ServiceError::new("ERR_ARTI_SHUTDOWN", "Arti startup gate panicked"),
+            );
+            return;
+        }
+    };
     match outcome {
         StartupOutcome::Ready(Ok(port)) if port != 0 => {
             let completions = mark_running(&shared, &options, port);
@@ -311,12 +484,12 @@ fn supervise(
                     port,
                 };
                 for completion in completions {
-                    completion(event.clone());
+                    safe_completion(completion, event.clone());
                 }
             } else {
                 cancel_once(&cancel);
             }
-            let result = join_worker(worker);
+            let result = observe_shutdown(&shared, worker);
             finish_worker(&shared, options.generation, result);
         }
         StartupOutcome::Ready(Ok(_)) => {
@@ -357,7 +530,10 @@ fn mark_running(
     options: &ServiceOptions,
     port: u16,
 ) -> Option<Vec<Completion>> {
-    let mut inner = shared.inner.lock().unwrap();
+    let mut inner = match lock_inner(shared) {
+        Ok(inner) => inner,
+        Err(_) => return None,
+    };
     let active = match std::mem::replace(&mut inner.state, State::Stopped) {
         State::Starting(active) if active.options == *options => active,
         state => {
@@ -382,7 +558,14 @@ fn stop_after_startup(
     reason: ServiceError,
 ) {
     {
-        let mut inner = shared.inner.lock().unwrap();
+        let mut inner = match lock_inner(shared) {
+            Ok(inner) => inner,
+            Err(_) => {
+                cancel_once(cancel);
+                drop(worker);
+                return;
+            }
+        };
         if let State::Starting(active) = &inner.state {
             if active.options.generation == generation {
                 let active = match std::mem::replace(&mut inner.state, State::Stopped) {
@@ -391,6 +574,7 @@ fn stop_after_startup(
                 };
                 inner.state = State::Stopping(Stopping {
                     generation,
+                    was_running: false,
                     start_completions: active.start_completions,
                     stop_completions: Vec::new(),
                     reason,
@@ -400,31 +584,54 @@ fn stop_after_startup(
     }
 
     cancel_once(cancel);
-    let result = join_worker(worker);
+    let result = observe_shutdown(shared, worker);
     finish_worker(shared, generation, result);
 }
 
-fn join_worker(worker: JoinHandle<Result<(), ServiceError>>) -> Result<(), ServiceError> {
-    match worker.join() {
-        Ok(result) => result,
+fn observe_shutdown(
+    shared: &Arc<Shared>,
+    worker: JoinHandle<Result<(), ServiceError>>,
+) -> Result<(), ServiceError> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        shared.shutdown_gate.wait(worker, SHUTDOWN_TIMEOUT)
+    })) {
+        Ok(ShutdownOutcome::Exited(result)) => result,
+        Ok(ShutdownOutcome::Timeout) => Err(ServiceError::new(
+            "ERR_ARTI_SHUTDOWN",
+            format!(
+                "Arti worker did not exit within {} milliseconds",
+                SHUTDOWN_TIMEOUT.as_millis()
+            ),
+        )),
         Err(_) => Err(ServiceError::new(
             "ERR_ARTI_SHUTDOWN",
-            "Arti worker thread panicked",
+            "Arti shutdown observer panicked",
         )),
     }
 }
 
 fn finish_worker(shared: &Arc<Shared>, generation: u64, worker_result: Result<(), ServiceError>) {
     let (start_completions, stop_completions, start_event, stop_event) = {
-        let mut inner = shared.inner.lock().unwrap();
+        let mut inner = match lock_inner(shared) {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
         match std::mem::replace(&mut inner.state, State::Stopped) {
             State::Stopping(stopping) if stopping.generation == generation => {
-                let terminal = worker_result
-                    .err()
-                    .filter(|error| error.code == "ERR_ARTI_SHUTDOWN");
+                let terminal = if stopping.reason.code == "ERR_ARTI_SHUTDOWN" {
+                    Some(stopping.reason.clone())
+                } else if stopping.was_running {
+                    worker_result
+                        .err()
+                        .map(|error| unexpected_exit_error(Some(error)))
+                } else {
+                    worker_result
+                        .err()
+                        .filter(|error| error.code == "ERR_ARTI_SHUTDOWN")
+                };
                 if let Some(error) = terminal {
                     let event = failed_event(generation, &error);
-                    inner.state = State::Failed;
+                    inner.state = State::Failed(error.clone());
                     (
                         stopping.start_completions,
                         stopping.stop_completions,
@@ -442,10 +649,8 @@ fn finish_worker(shared: &Arc<Shared>, generation: u64, worker_result: Result<()
                 }
             }
             State::Running(running) if running.options.generation == generation => {
-                inner.state = State::Failed;
-                let error = worker_result.err().unwrap_or_else(|| {
-                    ServiceError::new("ERR_ARTI_SHUTDOWN", "Arti worker exited unexpectedly")
-                });
+                let error = unexpected_exit_error(worker_result.err());
+                inner.state = State::Failed(error.clone());
                 let event = failed_event(generation, &error);
                 (Vec::new(), Vec::new(), event.clone(), event)
             }
@@ -457,10 +662,10 @@ fn finish_worker(shared: &Arc<Shared>, generation: u64, worker_result: Result<()
     };
 
     for completion in start_completions {
-        completion(start_event.clone());
+        safe_completion(completion, start_event.clone());
     }
     for completion in stop_completions {
-        completion(stop_event.clone());
+        safe_completion(completion, stop_event.clone());
     }
 }
 
@@ -471,8 +676,129 @@ fn cancel_once(cancel: &CancelSender) {
     }
 }
 
-fn dispatch(completion: Completion, event: ServiceEvent) {
-    thread::spawn(move || completion(event));
+fn safe_completion(completion: Completion, event: ServiceEvent) {
+    let _ = catch_unwind(AssertUnwindSafe(|| completion(event)));
+}
+
+fn safe_task(task: SupervisorTask) {
+    let _ = catch_unwind(AssertUnwindSafe(task));
+}
+
+fn lock_inner<'a>(
+    shared: &'a Arc<Shared>,
+) -> Result<std::sync::MutexGuard<'a, Inner>, ServiceError> {
+    match shared.inner.lock() {
+        Ok(inner) => Ok(inner),
+        Err(poisoned) => {
+            let terminal =
+                ServiceError::new("ERR_ARTI_SHUTDOWN", "Arti service state mutex was poisoned");
+            let mut inner = poisoned.into_inner();
+            let state = std::mem::replace(&mut inner.state, State::Failed(terminal.clone()));
+            let (generation, start_completions, stop_completions) = match state {
+                State::Starting(active) => (
+                    active.options.generation,
+                    active.start_completions,
+                    Vec::new(),
+                ),
+                State::Stopping(stopping) => (
+                    stopping.generation,
+                    stopping.start_completions,
+                    stopping.stop_completions,
+                ),
+                state => {
+                    inner.state = match state {
+                        State::Failed(error) => State::Failed(error),
+                        _ => State::Failed(terminal.clone()),
+                    };
+                    (inner.last_generation, Vec::new(), Vec::new())
+                }
+            };
+            shared.inner.clear_poison();
+            drop(inner);
+            let event = failed_event(generation, &terminal);
+            for completion in start_completions {
+                safe_completion(completion, event.clone());
+            }
+            for completion in stop_completions {
+                safe_completion(completion, event.clone());
+            }
+            Err(terminal)
+        }
+    }
+}
+
+fn cancel_current(shared: &Arc<Shared>, generation: u64) {
+    let cancel = match lock_inner(shared) {
+        Ok(inner) => match &inner.state {
+            State::Starting(active) if active.options.generation == generation => {
+                Some(active.cancel.clone())
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    if let Some(cancel) = cancel {
+        cancel_once(&cancel);
+    }
+}
+
+fn finish_creation_failure(
+    shared: &Arc<Shared>,
+    generation: u64,
+    error: ServiceError,
+    terminal: bool,
+) {
+    let (start_completions, stop_completions) = {
+        let mut inner = match lock_inner(shared) {
+            Ok(inner) => inner,
+            Err(_) => return,
+        };
+        let state = std::mem::replace(&mut inner.state, State::Stopped);
+        let (start_completions, stop_completions) = match state {
+            State::Starting(active) if active.options.generation == generation => {
+                (active.start_completions, Vec::new())
+            }
+            State::Stopping(stopping) if stopping.generation == generation => {
+                (stopping.start_completions, stopping.stop_completions)
+            }
+            state => {
+                inner.state = state;
+                return;
+            }
+        };
+        if terminal {
+            inner.state = State::Failed(error.clone());
+        }
+        (start_completions, stop_completions)
+    };
+
+    let failed = failed_event(generation, &error);
+    for completion in start_completions {
+        safe_completion(completion, failed.clone());
+    }
+    for completion in stop_completions {
+        safe_completion(
+            completion,
+            if terminal {
+                failed.clone()
+            } else {
+                ServiceEvent::Stopped { generation }
+            },
+        );
+    }
+}
+
+fn unexpected_exit_error(error: Option<ServiceError>) -> ServiceError {
+    match error {
+        Some(error) => ServiceError::new(
+            "ERR_ARTI_SHUTDOWN",
+            format!(
+                "Arti worker exited unexpectedly ({}: {})",
+                error.code, error.message
+            ),
+        ),
+        None => ServiceError::new("ERR_ARTI_SHUTDOWN", "Arti worker exited unexpectedly"),
+    }
 }
 
 fn failed_event(generation: u64, error: &ServiceError) -> ServiceEvent {
@@ -492,10 +818,6 @@ fn conflict_error() -> ServiceError {
 
 fn cancelled_error() -> ServiceError {
     ServiceError::new("ERR_ARTI_CANCELLED", "Arti service is stopping")
-}
-
-fn shutdown_error() -> ServiceError {
-    ServiceError::new("ERR_ARTI_SHUTDOWN", "Arti service is in a failed state")
 }
 
 fn generation_error(last: u64, requested: u64) -> ServiceError {
@@ -562,7 +884,7 @@ mod tests {
             options: ServiceOptions,
             cancel: oneshot::Receiver<()>,
             ready: mpsc::SyncSender<Result<u16, ServiceError>>,
-        ) -> thread::JoinHandle<Result<(), ServiceError>> {
+        ) -> Result<thread::JoinHandle<Result<(), ServiceError>>, ServiceError> {
             let (cancelled_tx, cancelled) = mpsc::sync_channel(0);
             let (finish, finish_rx) = mpsc::sync_channel(0);
             self.spawn_count.fetch_add(1, Ordering::SeqCst);
@@ -575,11 +897,16 @@ mod tests {
                 })
                 .unwrap();
 
-            thread::spawn(move || {
-                let _ = cancel.blocking_recv();
-                let _ = cancelled_tx.send(());
-                finish_rx.recv().unwrap_or(Ok(()))
-            })
+            thread::Builder::new()
+                .name("bare-arti-test-worker".into())
+                .spawn(move || {
+                    thread::spawn(move || {
+                        let _ = cancel.blocking_recv();
+                        let _ = cancelled_tx.send(());
+                    });
+                    finish_rx.recv().unwrap_or(Ok(()))
+                })
+                .map_err(|error| ServiceError::new("ERR_ARTI_BOOTSTRAP", error.to_string()))
         }
     }
 
@@ -1005,5 +1332,383 @@ mod tests {
             harness.controller.stop(1, done).unwrap_err().code,
             "ERR_ARTI_SHUTDOWN"
         );
+    }
+
+    #[test]
+    fn post_ready_worker_error_during_stop_is_terminal_with_diagnostics() {
+        let harness = Harness::new();
+        let (done, running) = completion();
+        harness
+            .controller
+            .start(options(1, "/private/a"), done)
+            .unwrap();
+        let worker = harness.worker();
+        harness.decisions.send(GateDecision::Ready).unwrap();
+        worker.ready.send(Ok(19050)).unwrap();
+        assert!(matches!(recv(&running), ServiceEvent::Running { .. }));
+
+        let (done, stopped) = completion();
+        harness.controller.stop(1, done).unwrap();
+        worker
+            .cancelled
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        worker
+            .finish
+            .send(Err(ServiceError::new(
+                "ERR_ARTI_BOOTSTRAP",
+                "worker failed while stopping",
+            )))
+            .unwrap();
+        let event = recv(&stopped);
+        assert!(matches!(
+            event,
+            ServiceEvent::Failed {
+                code: "ERR_ARTI_SHUTDOWN",
+                ..
+            }
+        ));
+        if let ServiceEvent::Failed { message, .. } = event {
+            assert!(message.contains("ERR_ARTI_BOOTSTRAP"));
+            assert!(message.contains("worker failed while stopping"));
+        }
+    }
+
+    struct FailingFactory {
+        panic: bool,
+    }
+
+    impl WorkerFactory for FailingFactory {
+        fn spawn(
+            &self,
+            _options: ServiceOptions,
+            _cancel: oneshot::Receiver<()>,
+            _ready: mpsc::SyncSender<Result<u16, ServiceError>>,
+        ) -> Result<thread::JoinHandle<Result<(), ServiceError>>, ServiceError> {
+            if self.panic {
+                panic!("factory panic")
+            }
+            Err(ServiceError::new(
+                "ERR_ARTI_BOOTSTRAP",
+                "factory refused worker",
+            ))
+        }
+    }
+
+    struct ImmediateShutdownTimeout;
+
+    impl ShutdownGate for ImmediateShutdownTimeout {
+        fn wait(
+            &self,
+            worker: thread::JoinHandle<Result<(), ServiceError>>,
+            _duration: Duration,
+        ) -> ShutdownOutcome {
+            drop(worker);
+            ShutdownOutcome::Timeout
+        }
+    }
+
+    struct FailingSupervisorSpawner;
+
+    impl SupervisorSpawner for FailingSupervisorSpawner {
+        fn spawn(&self, task: SupervisorTask) -> Result<(), SupervisorSpawnError> {
+            Err(SupervisorSpawnError {
+                error: ServiceError::new("ERR_ARTI_SHUTDOWN", "supervisor thread creation failed"),
+                task,
+            })
+        }
+    }
+
+    struct PanickingSupervisorSpawner;
+
+    impl SupervisorSpawner for PanickingSupervisorSpawner {
+        fn spawn(&self, _task: SupervisorTask) -> Result<(), SupervisorSpawnError> {
+            panic!("supervisor spawner panic")
+        }
+    }
+
+    struct PanickingStartupGate;
+
+    impl StartupGate for PanickingStartupGate {
+        fn wait(
+            &self,
+            _ready: mpsc::Receiver<Result<u16, ServiceError>>,
+            _duration: Duration,
+        ) -> StartupOutcome {
+            panic!("startup gate panic")
+        }
+    }
+
+    #[test]
+    fn factory_error_and_panic_complete_once_and_release_state() {
+        for panic in [false, true] {
+            let (decision_tx, decision_rx) = mpsc::channel();
+            let controller = ServiceController::new(
+                Arc::new(FailingFactory { panic }),
+                Arc::new(ManualGate {
+                    decisions: Mutex::new(decision_rx),
+                }),
+            );
+            drop(decision_tx);
+            let (done, failed) = completion();
+            controller.start(options(1, "/private/a"), done).unwrap();
+            assert!(matches!(
+                recv(&failed),
+                ServiceEvent::Failed {
+                    generation: 1,
+                    code: "ERR_ARTI_BOOTSTRAP",
+                    ..
+                }
+            ));
+            assert!(matches!(
+                failed.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected)
+            ));
+
+            let (done, restarted) = completion();
+            controller.start(options(2, "/private/a"), done).unwrap();
+            assert!(matches!(
+                recv(&restarted),
+                ServiceEvent::Failed { generation: 2, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn supervisor_spawn_failure_cancels_and_fails_terminal_once() {
+        let (decision_tx, decision_rx) = mpsc::channel();
+        let (spawned_tx, spawned) = mpsc::channel();
+        let controller = ServiceController::with_dependencies(
+            Arc::new(ControlledFactory {
+                spawned: spawned_tx,
+                spawn_count: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ManualGate {
+                decisions: Mutex::new(decision_rx),
+            }),
+            Arc::new(ProductionShutdownGate),
+            Arc::new(FailingSupervisorSpawner),
+        );
+        drop(decision_tx);
+        let (done, failed) = completion();
+        controller.start(options(1, "/private/a"), done).unwrap();
+        let worker = spawned.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker
+            .cancelled
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            recv(&failed),
+            ServiceEvent::Failed {
+                code: "ERR_ARTI_SHUTDOWN",
+                ..
+            }
+        ));
+        worker.finish.send(Ok(())).unwrap();
+        let (done, _rx) = completion();
+        assert_eq!(
+            controller
+                .start(options(2, "/private/a"), done)
+                .unwrap_err()
+                .code,
+            "ERR_ARTI_SHUTDOWN"
+        );
+    }
+
+    #[test]
+    fn supervisor_spawner_panic_cancels_and_fails_terminal() {
+        let (decision_tx, decision_rx) = mpsc::channel();
+        let (spawned_tx, spawned) = mpsc::channel();
+        let controller = ServiceController::with_dependencies(
+            Arc::new(ControlledFactory {
+                spawned: spawned_tx,
+                spawn_count: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ManualGate {
+                decisions: Mutex::new(decision_rx),
+            }),
+            Arc::new(ProductionShutdownGate),
+            Arc::new(PanickingSupervisorSpawner),
+        );
+        drop(decision_tx);
+        let (done, failed) = completion();
+        controller.start(options(1, "/private/a"), done).unwrap();
+        let worker = spawned.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker
+            .cancelled
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            recv(&failed),
+            ServiceEvent::Failed {
+                code: "ERR_ARTI_SHUTDOWN",
+                ..
+            }
+        ));
+        worker.finish.send(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn startup_gate_panic_cancels_worker_and_fails_terminal() {
+        let (spawned_tx, spawned) = mpsc::channel();
+        let controller = ServiceController::new(
+            Arc::new(ControlledFactory {
+                spawned: spawned_tx,
+                spawn_count: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(PanickingStartupGate),
+        );
+        let (done, failed) = completion();
+        controller.start(options(1, "/private/a"), done).unwrap();
+        let worker = spawned.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker
+            .cancelled
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        worker.finish.send(Ok(())).unwrap();
+        assert!(matches!(
+            recv(&failed),
+            ServiceEvent::Failed {
+                code: "ERR_ARTI_SHUTDOWN",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn panicking_completion_does_not_block_later_callbacks_or_shutdown() {
+        let harness = Harness::new();
+        let (order_tx, order) = mpsc::channel();
+        let first_tx = order_tx.clone();
+        harness
+            .controller
+            .start(
+                options(1, "/private/a"),
+                Box::new(move |_| {
+                    first_tx.send(1).unwrap();
+                    panic!("consumer callback panic")
+                }),
+            )
+            .unwrap();
+        let worker = harness.worker();
+        harness
+            .controller
+            .start(
+                options(1, "/private/a"),
+                Box::new(move |_| order_tx.send(2).unwrap()),
+            )
+            .unwrap();
+        harness.decisions.send(GateDecision::Ready).unwrap();
+        worker.ready.send(Ok(19050)).unwrap();
+        assert_eq!(order.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        assert_eq!(order.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+        stop_running(&harness, worker, 1);
+    }
+
+    #[test]
+    fn shutdown_observation_timeout_is_terminal_without_waiting_for_worker() {
+        let (decision_tx, decision_rx) = mpsc::channel();
+        let (spawned_tx, spawned) = mpsc::channel();
+        let controller = ServiceController::with_shutdown_gate(
+            Arc::new(ControlledFactory {
+                spawned: spawned_tx,
+                spawn_count: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(ManualGate {
+                decisions: Mutex::new(decision_rx),
+            }),
+            Arc::new(ImmediateShutdownTimeout),
+        );
+        let (done, started) = completion();
+        controller.start(options(1, "/private/a"), done).unwrap();
+        let worker = spawned.recv_timeout(Duration::from_secs(1)).unwrap();
+        decision_tx.send(GateDecision::Timeout).unwrap();
+        worker
+            .cancelled
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            recv(&started),
+            ServiceEvent::Failed {
+                code: "ERR_ARTI_SHUTDOWN",
+                ..
+            }
+        ));
+        worker.finish.send(Ok(())).unwrap();
+        let (done, _rx) = completion();
+        assert_eq!(
+            controller
+                .start(options(2, "/private/a"), done)
+                .unwrap_err()
+                .code,
+            "ERR_ARTI_SHUTDOWN"
+        );
+    }
+
+    #[test]
+    fn unexpected_post_ready_exit_is_terminal_with_worker_diagnostics() {
+        let harness = Harness::new();
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        {
+            let mut inner = harness.controller.shared.inner.lock().unwrap();
+            inner.last_generation = 1;
+            inner.state = State::Running(Running {
+                options: options(1, "/private/a"),
+                cancel: Arc::new(Mutex::new(Some(cancel_tx))),
+                port: 19050,
+            });
+        }
+        finish_worker(
+            &harness.controller.shared,
+            1,
+            Err(ServiceError::new("ERR_ARTI_BOOTSTRAP", "tor loop crashed")),
+        );
+
+        let (done, _rx) = completion();
+        let error = harness
+            .controller
+            .start(options(2, "/private/a"), done)
+            .unwrap_err();
+        assert_eq!(error.code, "ERR_ARTI_SHUTDOWN");
+        assert!(error.message.contains("ERR_ARTI_BOOTSTRAP"));
+        assert!(error.message.contains("tor loop crashed"));
+    }
+
+    #[test]
+    fn poisoned_state_mutex_becomes_stable_terminal_shutdown() {
+        let harness = Harness::new();
+        let shared = harness.controller.shared.clone();
+        let _ = thread::spawn(move || {
+            let _guard = shared.inner.lock().unwrap();
+            panic!("poison state")
+        })
+        .join();
+
+        for generation in [1, 2] {
+            let (done, _rx) = completion();
+            assert_eq!(
+                harness
+                    .controller
+                    .start(options(generation, "/private/a"), done)
+                    .unwrap_err()
+                    .code,
+                "ERR_ARTI_SHUTDOWN"
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_generation_is_rejected_synchronously() {
+        let harness = Harness::new();
+        let (done, _rx) = completion();
+        assert_eq!(
+            harness
+                .controller
+                .start(options(u64::MAX, "/private/a"), done)
+                .unwrap_err()
+                .code,
+            "ERR_ARTI_CONFIG"
+        );
+        assert_eq!(harness.spawn_count.load(Ordering::SeqCst), 0);
     }
 }
