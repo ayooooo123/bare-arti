@@ -6,6 +6,7 @@
   "addon": true,
   "files": [
     "index.js",
+    "lib/**/*.js",
     "binding.c",
     "binding.js",
     "addon/Cargo.toml",

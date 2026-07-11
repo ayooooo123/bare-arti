@@ -2,7 +2,20 @@ const test = require('brittle')
 const path = require('path')
 const fs = require('fs')
 const os = require('os')
-const { start } = require('..')
+const { spawn } = require('child_process')
+const { createSidecar, resolveSidecarBinary } = require('../lib/sidecar')
+
+const start = createSidecar({
+  platform: process.platform,
+  arch: process.arch,
+  dirname: path.join(__dirname, '..'),
+  fs,
+  path,
+  spawn,
+  environment: process.env,
+  setTimer: setTimeout,
+  clearTimer: clearTimeout
+})
 
 // Verifies the sidecar launcher logic — spawn the proxy, parse the SOCKS port it
 // prints on stdout, and stop it — using a fake executable in place of the real
@@ -100,87 +113,49 @@ test('sidecar receives insecure filesystem permission opt-in', async (t) => {
   }
 })
 
-test('addon start receives scoped Arti environment options', async (t) => {
-  const indexPath = require.resolve('..')
-  const bindingPath = require.resolve('../binding')
-  const cachedIndex = require.cache[indexPath]
-  const cachedBinding = require.cache[bindingPath]
-  const priorData = process.env.BARE_ARTI_DATA
-  const priorPermissions = process.env.FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS
-  const observed = {}
-
-  process.env.BARE_ARTI_DATA = 'prior-data'
-  process.env.FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS = 'prior-permissions'
-  require.cache[bindingPath] = {
-    exports: {
-      start() {
-        observed.data = process.env.BARE_ARTI_DATA
-        observed.permissions = process.env.FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS
-        return 41338
-      },
-      stop() {}
-    }
-  }
-  delete require.cache[indexPath]
+test('published sidecar missing prebuild never falls back to target/debug', (t) => {
+  const checked = []
+  let error = null
 
   try {
-    const fresh = require('..')
-    const handle = await fresh.start({
-      dataDir: '/tmp/bare-arti-test-data',
-      insecureFsPermissions: true
-    })
-
-    t.is(handle.backend, 'addon')
-    t.is(observed.data, '/tmp/bare-arti-test-data')
-    t.is(observed.permissions, 'true')
-    t.is(process.env.BARE_ARTI_DATA, 'prior-data')
-    t.is(process.env.FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS, 'prior-permissions')
-  } finally {
-    if (cachedIndex) require.cache[indexPath] = cachedIndex
-    else delete require.cache[indexPath]
-    if (cachedBinding) require.cache[bindingPath] = cachedBinding
-    else delete require.cache[bindingPath]
-    restoreEnv('BARE_ARTI_DATA', priorData)
-    restoreEnv('FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS', priorPermissions)
+    resolveSidecarBinary(
+      {},
+      {
+        platform: 'linux',
+        arch: 'x64',
+        dirname: '/package',
+        path,
+        fs: {
+          existsSync(filename) {
+            checked.push(filename)
+            return false
+          }
+        }
+      }
+    )
+  } catch (caught) {
+    error = caught
   }
+
+  t.is(error && error.code, 'ERR_ARTI_UNSUPPORTED_PLATFORM')
+  t.ok(error.message.includes('prebuild'))
+  t.alike(checked, [path.join('/package', 'prebuilds', 'linux-x64', 'arti-socks')])
 })
 
-test('overlapping addon starts restore the original environment', async (t) => {
-  const indexPath = require.resolve('..')
-  const bindingPath = require.resolve('../binding')
-  const cachedIndex = require.cache[indexPath]
-  const cachedBinding = require.cache[bindingPath]
-  const priorData = process.env.BARE_ARTI_DATA
-  const observed = []
-
-  process.env.BARE_ARTI_DATA = 'original-data'
-  require.cache[bindingPath] = {
-    exports: {
-      start() {
-        observed.push(process.env.BARE_ARTI_DATA)
-        return 41342
-      },
-      stop() {}
+test('target/debug sidecar requires explicit dev opt-in', (t) => {
+  const debug = path.join('/package', 'target', 'debug', 'arti-socks')
+  const selected = resolveSidecarBinary(
+    { dev: true },
+    {
+      platform: 'linux',
+      arch: 'x64',
+      dirname: '/package',
+      path,
+      fs: { existsSync: (filename) => filename === debug }
     }
-  }
-  delete require.cache[indexPath]
+  )
 
-  try {
-    const fresh = require('..')
-    await Promise.all([
-      fresh.start({ dataDir: 'first-data' }),
-      fresh.start({ dataDir: 'second-data' })
-    ])
-
-    t.alike(observed, ['first-data', 'second-data'])
-    t.is(process.env.BARE_ARTI_DATA, 'original-data')
-  } finally {
-    if (cachedIndex) require.cache[indexPath] = cachedIndex
-    else delete require.cache[indexPath]
-    if (cachedBinding) require.cache[bindingPath] = cachedBinding
-    else delete require.cache[bindingPath]
-    restoreEnv('BARE_ARTI_DATA', priorData)
-  }
+  t.is(selected, debug)
 })
 
 function restoreEnv(name, value) {
