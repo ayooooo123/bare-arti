@@ -135,6 +135,38 @@ test('desktop explicit addon starts only addon', async (t) => {
   t.is(sidecarCalls, 0)
 })
 
+test('matching addon starts share one stored backend promise', async (t) => {
+  const nativeStart = deferred()
+  let startCalls = 0
+  const addon = observableAddon({
+    start() {
+      startCalls++
+      return nativeStart.promise
+    },
+    stop: () => Promise.resolve()
+  })
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar: t.fail
+  })
+  const first = backend.start({ backend: 'addon', dataDir: '/private/a', timeout: 1000 })
+  const matching = backend.start({ backend: 'addon', dataDir: '/private/a', timeout: 1000 })
+  const conflicting = backend.start({
+    backend: 'addon',
+    dataDir: '/private/b',
+    timeout: 1000
+  })
+
+  t.is(first, matching)
+  t.is(startCalls, 1)
+  nativeStart.resolve({ port: 19050, backend: 'addon', stop() {} })
+  const conflictError = await rejection(conflicting)
+  t.is(conflictError && conflictError.code, 'ERR_ARTI_CONFIG_CONFLICT')
+  await first
+})
+
 test('backend stop delegates to the selected backend', async (t) => {
   let stops = 0
   const stopped = deferred()
@@ -407,8 +439,7 @@ test('rejected addon startup cleans ownership before sidecar', async (t) => {
   addon = observableAddon({
     start: () => Promise.reject(bootstrap),
     stop() {
-      addon.emit({ status: 'stopped' })
-      return Promise.resolve()
+      return Promise.resolve().then(() => addon.emit({ status: 'stopped' }))
     }
   })
   const backend = createBackend({
@@ -422,10 +453,34 @@ test('rejected addon startup cleans ownership before sidecar', async (t) => {
   })
 
   await rejection(backend.start({ backend: 'addon', dataDir: '/private/a' }))
-  await Promise.resolve()
   const started = await backend.start({ dataDir: '/private/a' })
   t.is(started && started.port, 19051)
   t.is(sidecarCalls, 1)
+})
+
+test('addon cleanup failure dominates rejected startup', async (t) => {
+  const bootstrap = new Error('addon bootstrap failed')
+  const cleanup = new Error('addon cleanup failed')
+  const addon = observableAddon({
+    start: () => Promise.reject(bootstrap),
+    stop: () => Promise.reject(cleanup)
+  })
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar: t.fail
+  })
+  const error = await rejection(
+    backend.start({ backend: 'addon', dataDir: '/private/a', timeout: 1000 })
+  )
+
+  t.is(error.code, 'ERR_ARTI_SHUTDOWN')
+  t.is(error.cause, cleanup)
+  t.is(
+    (await rejection(backend.start({ backend: 'addon', dataDir: '/private/a' }))).code,
+    'ERR_ARTI_SHUTDOWN'
+  )
 })
 
 test('direct addon handle stop releases backend ownership', async (t) => {

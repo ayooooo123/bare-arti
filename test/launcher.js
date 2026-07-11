@@ -277,6 +277,55 @@ test('real Node ENOENT remains bootstrap and confirms no child', async (t) => {
   await operation.stopped
 })
 
+test('real Node EACCES remains bootstrap and confirms no child', async (t) => {
+  const bin = path.join(os.tmpdir(), `bare-arti-not-executable-${process.pid}`)
+  fs.writeFileSync(bin, '#!/bin/sh\necho 19050\n', { mode: 0o644 })
+
+  try {
+    const operation = startSidecar({ bin, timeout: 1000 })
+    const error = await rejection(operation.promise)
+    const stoppedError = await rejection(operation.stopped)
+
+    t.is(error.code, 'ERR_ARTI_BOOTSTRAP')
+    t.is(stoppedError, null, 'process absence is confirmed by close')
+  } finally {
+    fs.unlinkSync(bin)
+  }
+})
+
+test('unspawned close confirmation is bounded', async (t) => {
+  const child = fakeChild()
+  const watchdogs = []
+  const operation = fakeSidecar(child, {
+    shutdownTimeout: 25,
+    setShutdownTimer(callback) {
+      watchdogs.push(callback)
+      return watchdogs.length
+    }
+  })({ bin: '/fake/arti-socks' })
+  const startingOutcome = rejection(operation.promise)
+  const stoppedOutcome = rejection(operation.stopped)
+  let settled = false
+  stoppedOutcome.then(() => (settled = true))
+  const error = new Error('permission denied before spawn')
+  error.code = 'EACCES'
+  child.emit('error', error)
+
+  t.is(child.killCalls, 0, 'does not signal a process that never spawned')
+  t.is(watchdogs.length, 1)
+  watchdogs[0]()
+  await Promise.resolve()
+  await Promise.resolve()
+  t.is(settled, true, 'watchdog settles unconfirmed process absence')
+  if (!settled) {
+    child.emit('close', -1)
+    await startingOutcome
+    return
+  }
+  t.is((await startingOutcome).code, 'ERR_ARTI_SHUTDOWN')
+  t.is((await stoppedOutcome).code, 'ERR_ARTI_SHUTDOWN')
+})
+
 test('sidecar timeout is stable and cleanup-owned', async (t) => {
   const child = fakeChild()
   let timeoutCallback = null
