@@ -216,6 +216,39 @@ for (const changedFinalEntry of ['identity', 'symlink']) {
   })
 }
 
+test('mobile addon rejects a stable replacement after the initial lstat', (t) => {
+  const root = temporaryDirectory()
+  const dataDir = path.join(root, 'state')
+  fs.mkdirSync(dataDir, { mode: 0o700 })
+  const replacement = fs.lstatSync(dataDir)
+  let lstatCalls = 0
+  const injectedFs = {
+    ...fs,
+    lstatSync(filename) {
+      lstatCalls++
+      if (lstatCalls > 1) return replacement
+
+      return {
+        dev: replacement.dev + 1,
+        ino: replacement.ino,
+        isSymbolicLink: () => false
+      }
+    }
+  }
+
+  t.teardown(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  expectConfigError(
+    t,
+    () =>
+      validateAddonOptions(
+        { backend: 'addon', dataDir },
+        { ...dependencies('android'), fs: injectedFs }
+      ),
+    'rejects replacement identity B even when it stays stable'
+  )
+})
+
 test('filesystem failures preserve a stable ArtiError shape and cause', (t) => {
   const original = new Error('injected mkdir failure')
   const injectedFs = {
