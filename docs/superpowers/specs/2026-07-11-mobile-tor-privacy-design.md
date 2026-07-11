@@ -84,17 +84,42 @@ Contract rules:
 
 - `start()` always returns a promise.
 - Concurrent starts share one startup operation and resolve to the same local
-  SOCKS port.
+  SOCKS port only when `backend`, canonical `dataDir`, and `timeout` match the
+  first request. A conflicting request rejects with `ERR_ARTI_CONFIG_CONFLICT`.
 - Calling `start()` while running returns the existing service.
-- `stop()` is idempotent and waits for the bootstrap thread or running service
-  to terminate.
+- The process has one service owner. All handles for the current generation
+  refer to that same service; calling `stop()` on any current handle stops it
+  for every caller. A handle from an older generation cannot stop a restarted
+  service and resolves as an idempotent no-op.
+- `stop()` is idempotent, generation-tagged, and waits for the bootstrap thread
+  or running service to terminate.
 - Stop during bootstrap rejects outstanding starts with a stable cancellation
-  error.
+  error. The configured timeout has the same global semantics: it requests
+  cancellation, joins the worker, transitions to `Stopped`, and rejects every
+  shared caller with `ERR_ARTI_TIMEOUT`. A late worker result is discarded by
+  generation and cannot start a service after timeout.
 - The addon accepts `dataDir` explicitly; it does not communicate configuration
   by mutating process-global environment variables.
 - Mobile requests for the addon fail with an explicit unsupported/missing
   prebuild error. They never try the desktop sidecar or a debug Cargo binary.
 - Desktop remains sidecar-first until the addon is independently promoted.
+
+Errors expose a stable `code` property:
+
+| Code | Meaning | Retryable after returning to `Stopped` |
+| --- | --- | --- |
+| `ERR_ARTI_UNSUPPORTED_PLATFORM` | No supported backend for this target | No |
+| `ERR_ARTI_ADDON_MISSING` | Required mobile addon prebuild cannot load | No |
+| `ERR_ARTI_CONFIG_CONFLICT` | Concurrent start options differ | Yes, after stop |
+| `ERR_ARTI_CANCELLED` | Stop or realm teardown cancelled startup | Yes |
+| `ERR_ARTI_TIMEOUT` | Bootstrap exceeded the configured timeout | Yes |
+| `ERR_ARTI_BOOTSTRAP` | Arti could not bootstrap | Yes |
+| `ERR_ARTI_BIND` | Loopback SOCKS listener could not bind | Yes |
+| `ERR_ARTI_SHUTDOWN` | Native worker did not terminate cleanly | No automatic retry |
+
+Every failure leaves the process in `Stopped`, except `ERR_ARTI_SHUTDOWN`, which
+leaves it in a terminal `Failed` state until process restart. PearTube remains
+offline for every error.
 
 ## Native Architecture
 
@@ -111,6 +136,24 @@ Stopped -> Starting -> Running
               v
             Stopped
 ```
+
+An unrecoverable join/shutdown failure transitions to `Failed`. Operation rules
+are deterministic:
+
+| Current state | Operation | Result |
+| --- | --- | --- |
+| `Stopped` | `start(A)` | Create generation N and enter `Starting(A)` |
+| `Starting(A)` | `start(A)` | Share generation N promise |
+| `Starting(A)` | `start(B)` | Reject `ERR_ARTI_CONFIG_CONFLICT` |
+| `Starting` | `stop(N)` or timeout | Cancel, join, reject starts, enter `Stopped` |
+| `Running(A)` | `start(A)` | Return generation N service |
+| `Running(A)` | `start(B)` | Reject `ERR_ARTI_CONFIG_CONFLICT` |
+| `Running` | `stop(N)` | Stop and join, enter `Stopped` |
+| `Stopping` | `start()` | Reject `ERR_ARTI_CANCELLED`; caller retries after stop |
+| any newer generation | `stop(old N)` | Resolve without changing state |
+| failed bootstrap | completion | Reject once and enter `Stopped` |
+| cancelled generation | late completion | Discard and free result |
+| `Failed` | any operation | Reject `ERR_ARTI_SHUTDOWN` |
 
 `Starting` owns a cancellation signal and a join handle. `Running` owns the
 Tokio runtime, SOCKS accept-loop handle, and bound port. The global mutex is held
@@ -137,15 +180,43 @@ No Rust worker thread may call a JavaScript or `bare-rust` value directly.
 Environment teardown registers a deferred teardown callback that requests stop
 and releases the thread-safe function without accessing a destroyed JS realm.
 
-The Rust C ABI is intentionally small:
+The Rust C ABI is intentionally small. C copies `data_dir` before returning from
+the call. Result strings are borrowed only for the duration of the callback, and
+`binding.c` copies them before queueing JS completion:
 
 ```c
-bare_arti_start(options, completion_callback, context)
-bare_arti_stop(completion_callback, context)
+typedef struct {
+  const char *data_dir;
+  uint64_t timeout_ms;
+  uint64_t generation;
+} bare_arti_options_t;
+
+typedef struct {
+  uint64_t generation;
+  uint16_t port;
+  const char *error_code;
+  const char *error_message;
+} bare_arti_result_t;
+
+typedef void (*bare_arti_completion_cb)(void *context,
+                                        const bare_arti_result_t *result);
+
+int bare_arti_start(const bare_arti_options_t *options,
+                    bare_arti_completion_cb callback,
+                    void *context);
+int bare_arti_stop(uint64_t generation,
+                   bare_arti_completion_cb callback,
+                   void *context);
 ```
 
-The exact ownership structs live in `binding.c`; Rust receives copied strings
-and primitive options only.
+The integer return reports only synchronous validation/queueing failure; an
+accepted operation invokes its callback exactly once from a non-JS worker
+thread. `binding.c` owns and frees the thread-safe function, deferred promise,
+copied result, and context after settlement. Duplicate callbacks are ignored by
+an atomic completion flag; Rust owns result storage for the callback duration,
+and the C completion context is released exactly once. Realm teardown
+aborts the thread-safe function, requests generation cancellation, and never
+settles a promise in the destroyed realm.
 
 ## Mobile Build Targets
 
@@ -155,12 +226,24 @@ Required release targets:
 - iOS device arm64 / Rust `aarch64-apple-ios`
 - iOS Simulator arm64 / Rust `aarch64-apple-ios-sim` for CI runtime tests
 
+Expected complete module paths are:
+
+```text
+prebuilds/android-arm64/bare-arti.bare
+prebuilds/ios-arm64/bare-arti.bare
+prebuilds/ios-arm64-simulator/bare-arti.bare
+```
+
 The workflow must build through the Bare toolchain, not merely compile the root
 Rust `rlib`. A target is considered supported only when the complete Bare module
 is installed into the expected prebuild layout and loaded by a BareKit harness.
 
 Android builds use a pinned NDK and minimum SDK. iOS builds use a pinned Xcode
 runner and deployment target. All Rust and npm dependency graphs remain locked.
+Simulator success proves CI runtime compatibility, not iPhone support. iOS is
+labelled experimental until the exact release addon loads and completes the
+privacy proof on a physical arm64 iPhone. Android has the equivalent physical
+arm64 device gate before production support.
 
 ## Test Strategy
 
@@ -209,13 +292,18 @@ supported.
 - iOS Simulator arm64 loads the packaged addon through BareKit.
 - Each harness verifies async resolution, loopback binding, stop, and restart.
 
-The event-loop test runs a short JS heartbeat while bootstrap is pending and
-fails if heartbeats pause beyond the allowed scheduling tolerance.
+The event-loop test warms up for one second, schedules a heartbeat every 50 ms,
+then holds an injected bootstrap pending for two seconds. It requires at least
+30 heartbeats during that window and fails on any gap above 250 ms. Real Tor
+bootstrap records the same metric for diagnostics but does not use it as the
+deterministic responsiveness gate.
 
 ### 5. Real Tor privacy test
 
-At least one mobile runtime job performs the full proof against a temporary v3
-onion relay:
+Both the Android arm64 emulator and iOS arm64 Simulator jobs perform the full
+proof against a temporary v3 onion relay. Each job may retry Tor bootstrap once
+with a fresh temporary state directory; a second failure fails the protected
+workflow:
 
 1. Start embedded Arti through the addon.
 2. Connect `dht-relay-tor` to the onion relay through its SOCKS port.
@@ -223,12 +311,18 @@ onion relay:
 4. Announce and discover a topic.
 5. Exchange a Noise payload.
 6. Assert the relay sees only its Tor-side loopback connection.
-7. Install a direct-transport sentinel that throws on construction or connect;
-   assert it was never invoked.
+7. Install a direct-transport factory sentinel that throws on construction or
+   connect; assert it was never invoked.
+8. Capture emulator/simulator network activity and assert there are no UDP
+   packets while Tor mode is active. Arti's expected outbound TCP connections
+   to Tor guards and loopback SOCKS traffic are allowed; any TCP connection to a
+   discovered peer address fails the test.
 
 Normal unit CI does not depend on Tor reachability. The protected mobile release
-workflow does require a successful real-network proof with bounded retries and
-diagnostic logs.
+workflow does require successful proofs on both simulated mobile runtimes with
+bounded retries and diagnostic logs. Before production support, the same test
+must pass on one physical Android arm64 device and one physical iPhone arm64
+device using the exact release artifacts.
 
 ## PearTube Integration Boundary
 
@@ -237,10 +331,11 @@ Arti first, verifies the onion relay, and only then creates RelayedDHT and
 Hyperswarm. The direct DHT implementation is not constructed. Any bootstrap,
 relay, or addon failure leaves the profile offline.
 
-Mobile lifecycle handling must stop or suspend networking when the OS revokes
-execution time, then revalidate Tor before restoring the swarm. A Wi-Fi/cellular
-transition may rebuild Tor circuits but must never temporarily enable direct
-HyperDHT.
+The first milestone implements stop-on-background and start-on-foreground; it
+does not expose native suspend/resume. PearTube must revalidate Tor before
+restoring the swarm. A later suspend API requires a separate design. A
+Wi-Fi/cellular transition may rebuild Tor circuits but must never temporarily
+enable direct HyperDHT.
 
 Separate Tor-mode peer keys should be supported so peers cannot trivially link
 a user's prior direct transport identity to their masked transport identity.
@@ -259,6 +354,27 @@ a user's prior direct transport identity to their masked transport identity.
 - Logs never include onion private keys, Tor state, peer secret keys, or full
   user filesystem paths.
 
+The process will make direct TCP connections to Tor guards; that is required for
+Tor and is not a peer-address leak. Packet tests distinguish those connections
+from forbidden direct peer traffic.
+
+## Mobile Resource Budgets
+
+Initial production gates per platform are:
+
+- compressed addon prebuild no larger than 30 MiB;
+- peak incremental resident memory no higher than 256 MiB during bootstrap;
+- steady incremental resident memory no higher than 128 MiB five minutes after
+  bootstrap;
+- idle CPU average below 2% over five minutes with no active SOCKS streams;
+- deterministic injected-bootstrap heartbeat gap no higher than 250 ms;
+- no background wake lock after `stop()` completes.
+
+CI records binary size on every build and fails regressions above the limit.
+Physical-device release tests record memory, CPU, and lifecycle metrics. Raising
+a budget requires an explicit spec and release-note change, not an unreviewed CI
+threshold edit.
+
 ## CI and Release Gates
 
 Mobile support may be documented or published only after all of the following
@@ -270,7 +386,11 @@ are green on the exact release commit:
 - iOS arm64 full addon build;
 - iOS Simulator addon load and responsiveness test;
 - Android emulator addon load and responsiveness test;
-- real Arti/onion/Hyperswarm privacy proof;
+- real Arti/onion/Hyperswarm privacy proof on both simulated mobile runtimes;
+- exact release-artifact privacy proof on physical Android arm64 and iPhone
+  arm64 before either is labelled production-supported;
+- packet assertion showing no UDP and no direct peer TCP path;
+- mobile resource-budget checks;
 - package tarball inspection containing the expected mobile prebuilds;
 - checksums and provenance for every native artifact.
 
