@@ -551,6 +551,37 @@ test('stopping blocks restart and settles only after native stop', async (t) => 
   t.is((await restarted).port, 19051)
 })
 
+test('start during a failing stop rejects cancelled after native settlement', async (t) => {
+  const nativeStop = deferred()
+  const shutdown = artiError('ERR_ARTI_SHUTDOWN', 'native shutdown failed')
+  const controller = createAddonController(
+    controllerOptions({
+      start: async () => ({ port: 19050 }),
+      stop: () => nativeStop.promise
+    })
+  )
+  const handle = await controller.start({ dataDir: '/private/a' })
+  const stopping = handle.stop()
+  const stopOutcome = rejection(stopping)
+  const blockedStart = controller.start({ dataDir: '/private/a' })
+  const blockedOutcome = rejection(blockedStart)
+  let blockedSettled = false
+  blockedOutcome.then(() => (blockedSettled = true))
+
+  await Promise.resolve()
+  await Promise.resolve()
+  t.is(blockedSettled, false, 'waits for native stop rejection')
+
+  nativeStop.reject(shutdown)
+  t.is(await stopOutcome, shutdown, 'original stop preserves native shutdown error')
+  t.is((await blockedOutcome).code, 'ERR_ARTI_CANCELLED', 'new start reports cancellation')
+  t.is(
+    (await rejection(controller.start({ dataDir: '/private/a' }))).code,
+    'ERR_ARTI_SHUTDOWN',
+    'terminal failed state is retained'
+  )
+})
+
 for (const nativeCompletion of ['resolve', 'reject']) {
   test(`native start ${nativeCompletion} during stop stays owned by stop`, async (t) => {
     const firstNativeStart = deferred()
