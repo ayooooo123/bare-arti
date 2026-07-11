@@ -86,6 +86,8 @@ Contract rules:
 - Concurrent starts share one startup operation and resolve to the same local
   SOCKS port only when `backend`, canonical `dataDir`, and `timeout` match the
   first request. A conflicting request rejects with `ERR_ARTI_CONFIG_CONFLICT`.
+- Within the owning Bare realm, matching concurrent calls return the same
+  JavaScript promise object, not merely equivalent promises.
 - Calling `start()` while running returns the existing service.
 - The process has one service owner. All handles for the current generation
   refer to that same service; calling `stop()` on any current handle stops it
@@ -103,6 +105,9 @@ Contract rules:
 - Mobile requests for the addon fail with an explicit unsupported/missing
   prebuild error. They never try the desktop sidecar or a debug Cargo binary.
 - Desktop remains sidecar-first until the addon is independently promoted.
+- The first mobile milestone supports one owning Bare JS realm per process. A
+  second realm fails explicitly; PearTube owns Arti from its single network
+  worker and exposes it to other realms only through IPC.
 
 Errors expose a stable `code` property:
 
@@ -111,6 +116,8 @@ Errors expose a stable `code` property:
 | `ERR_ARTI_UNSUPPORTED_PLATFORM` | No supported backend for this target | No |
 | `ERR_ARTI_ADDON_MISSING` | Required mobile addon prebuild cannot load | No |
 | `ERR_ARTI_CONFIG_CONFLICT` | Concurrent start options differ | Yes, after stop |
+| `ERR_ARTI_REALM_CONFLICT` | Another Bare realm owns process-wide Arti | No in that process |
+| `ERR_ARTI_CONFIG` | Data directory or timeout is invalid | Yes with corrected options |
 | `ERR_ARTI_CANCELLED` | Stop or realm teardown cancelled startup | Yes |
 | `ERR_ARTI_TIMEOUT` | Bootstrap exceeded the configured timeout | Yes |
 | `ERR_ARTI_BOOTSTRAP` | Arti could not bootstrap | Yes |
@@ -120,6 +127,13 @@ Errors expose a stable `code` property:
 Every failure leaves the process in `Stopped`, except `ERR_ARTI_SHUTDOWN`, which
 leaves it in a terminal `Failed` state until process restart. PearTube remains
 offline for every error.
+
+`dataDir` must be an absolute path after platform-aware JS normalization. The
+addon creates it with owner-only permissions, canonicalizes the resulting path,
+and uses that canonical path for configuration equality. Failure to create,
+canonicalize, or secure the directory rejects as `ERR_ARTI_CONFIG`. A final
+directory that resolves through a symbolic link is rejected on mobile. Timeout
+must be an integer from 1,000 through 1,800,000 ms; the default is 600,000 ms.
 
 ## Native Architecture
 
@@ -154,6 +168,22 @@ are deterministic:
 | failed bootstrap | completion | Reject once and enter `Stopped` |
 | cancelled generation | late completion | Discard and free result |
 | `Failed` | any operation | Reject `ERR_ARTI_SHUTDOWN` |
+
+### Realm ownership
+
+`binding.c` claims one process-wide owner when the first addon realm initializes.
+Only that realm can call the private native start/stop functions. The public JS
+wrapper holds the single in-flight promise and fans it out to matching callers,
+so it invokes `bare_arti_start()` exactly once per generation. A direct duplicate
+native start request is rejected synchronously as API misuse.
+
+Owner-realm teardown marks its completion context aborted, aborts its thread-safe
+function, and requests cancellation of the current generation. The context
+remains allocated until the Rust worker reports completion; that completion
+performs native cleanup without touching the destroyed JS realm and then frees
+the context. Because multiple owning realms are unsupported, teardown cannot
+cancel another supported caller's service. Other PearTube realms communicate
+with the network worker over IPC and never load the addon.
 
 `Starting` owns a cancellation signal and a join handle. `Running` owns the
 Tokio runtime, SOCKS accept-loop handle, and bound port. The global mutex is held
@@ -258,6 +288,9 @@ a test that fails for the expected missing behavior.
 - Repeated stop is safe.
 - Mobile addon load failure is explicit and never invokes sidecar spawn.
 - Desktop backend selection remains sidecar-first.
+- Matching callers receive the same promise; conflicting options reject.
+- Invalid, relative, insecure, or symlinked mobile data directories reject.
+- A second Bare realm rejects with `ERR_ARTI_REALM_CONFLICT`.
 
 The binding is injected through the module cache, following the existing
 launcher tests. These tests run on Node without Tor egress.
@@ -274,6 +307,12 @@ controlled delayed result without contacting Tor. Verify:
 - idempotent stop;
 - restart after stop;
 - all worker/runtime resources are joined or dropped.
+
+The state suite also has one test for every operation-table rule: matching
+configuration shares startup, conflicting configuration rejects, global timeout
+cancels all callers, late completion after timeout is discarded, stale-generation
+stop is a no-op, start during `Stopping` rejects, failed bootstrap returns to
+`Stopped`, and shutdown/join failure enters terminal `Failed`.
 
 Protocol parsing remains covered independently from live Tor reachability.
 
@@ -317,6 +356,14 @@ workflow:
    packets while Tor mode is active. Arti's expected outbound TCP connections
    to Tor guards and loopback SOCKS traffic are allowed; any TCP connection to a
    discovered peer address fails the test.
+
+Network capture is process-scoped, not runner-interface-wide. Test builds link a
+small socket-audit shim around the app process's socket/connect entry points. It
+records address family, socket type, destination, and timestamp to the harness.
+The assertion window starts immediately before Tor-profile construction and ends
+after teardown. Traffic from the CI host, emulator services, and other processes
+cannot enter the record. The shim is test-only and is excluded from release
+artifacts by the package allowlist test.
 
 Normal unit CI does not depend on Tor reachability. The protected mobile release
 workflow does require successful proofs on both simulated mobile runtimes with
