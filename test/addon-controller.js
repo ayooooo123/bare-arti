@@ -35,10 +35,14 @@ test('valid Android addon options are normalized and frozen', (t) => {
 
   t.teardown(() => fs.rmSync(root, { recursive: true, force: true }))
 
-  const options = validateAddonOptions({ backend: 'addon', dataDir }, dependencies('android'))
+  const options = validateAddonOptions(
+    { backend: 'addon', dataDir, bootstrapTimeout: 42 },
+    dependencies('android')
+  )
 
   t.is(options.backend, 'addon', 'keeps the addon backend')
-  t.is(options.bootstrapTimeout, 600000, 'uses the exact default timeout')
+  t.is(options.timeout, 600000, 'uses the exact default timeout')
+  t.absent(options.bootstrapTimeout, 'does not expose the obsolete timeout field')
   t.is(options.dataDir, fs.realpathSync(dataDir), 'returns the canonical path')
   t.ok(Object.isFrozen(options), 'freezes the normalized options')
   t.alike({ ...process.env }, beforeEnvironment, 'does not mutate process.env')
@@ -52,28 +56,24 @@ test('explicit maximum-normal timeout is accepted', (t) => {
   t.teardown(() => fs.rmSync(root, { recursive: true, force: true }))
 
   const options = validateAddonOptions(
-    { backend: 'addon', dataDir, bootstrapTimeout: 600000 },
+    { backend: 'addon', dataDir, timeout: 600000 },
     dependencies('ios')
   )
 
-  t.is(options.bootstrapTimeout, 600000)
+  t.is(options.timeout, 600000)
 })
 
-test('invalid addon bootstrap timeouts are rejected', (t) => {
+test('invalid addon timeouts are rejected', (t) => {
   const invalid = [999, 1800001, 1000.5, '600000']
 
-  for (const bootstrapTimeout of invalid) {
+  for (const timeout of invalid) {
     const root = temporaryDirectory()
     const dataDir = path.join(root, 'state')
 
     expectConfigError(
       t,
-      () =>
-        validateAddonOptions(
-          { backend: 'addon', dataDir, bootstrapTimeout },
-          dependencies('android')
-        ),
-      `rejects ${bootstrapTimeout}`
+      () => validateAddonOptions({ backend: 'addon', dataDir, timeout }, dependencies('android')),
+      `rejects ${timeout}`
     )
 
     fs.rmSync(root, { recursive: true, force: true })
