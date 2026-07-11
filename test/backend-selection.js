@@ -1,4 +1,5 @@
 const test = require('brittle')
+const path = require('path')
 
 const { createBackend } = require('../lib/backend')
 const { ArtiError } = require('../lib/errors')
@@ -29,11 +30,23 @@ function sidecarOperation(starting, stopping = never) {
   return { promise: starting, stop: () => stopping, stopped: stopping }
 }
 
-function observableAddon({ start, stop }) {
+function observableAddon({ start, stop, matchesOptions }) {
   const observers = new Set()
+  let activeOptions = null
   return {
-    start,
+    start(options) {
+      activeOptions = options
+      return start(options)
+    },
     stop,
+    matchesOptions(options) {
+      if (matchesOptions) return matchesOptions(options, activeOptions)
+      return (
+        options.dataDir === activeOptions.dataDir &&
+        (options.timeout === undefined ? 600000 : options.timeout) ===
+          (activeOptions.timeout === undefined ? 600000 : activeOptions.timeout)
+      )
+    },
     observeLifecycle(observer) {
       observers.add(observer)
       return () => observers.delete(observer)
@@ -122,7 +135,8 @@ test('desktop explicit addon starts only addon', async (t) => {
           t.is(options.backend, 'addon')
           return expected
         },
-        stop() {}
+        stop() {},
+        matchesOptions: () => true
       }
     },
     startSidecar() {
@@ -164,6 +178,67 @@ test('matching addon starts share one stored backend promise', async (t) => {
   nativeStart.resolve({ port: 19050, backend: 'addon', stop() {} })
   const conflictError = await rejection(conflicting)
   t.is(conflictError && conflictError.code, 'ERR_ARTI_CONFIG_CONFLICT')
+  await first
+})
+
+test('canonical-equivalent addon options share one stored backend promise', async (t) => {
+  const nativeStart = deferred()
+  let startCalls = 0
+  let validationCalls = 0
+  const addon = observableAddon({
+    start() {
+      startCalls++
+      return nativeStart.promise
+    },
+    stop: () => Promise.resolve(),
+    matchesOptions(options, activeOptions) {
+      validationCalls++
+      return path.normalize(options.dataDir) === path.normalize(activeOptions.dataDir)
+    }
+  })
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar: t.fail
+  })
+  const first = backend.start({ backend: 'addon', dataDir: '/private/state' })
+  const equivalent = backend.start({
+    backend: 'addon',
+    dataDir: '/private/parent/../state'
+  })
+
+  t.is(first, equivalent, 'shares the exact public wrapper promise')
+  t.is(startCalls, 1, 'starts native once')
+  t.is(validationCalls, 1, 'revalidates the repeated request')
+  nativeStart.resolve({ port: 19050, backend: 'addon', stop() {} })
+  await first
+})
+
+test('identical raw addon options are revalidated before sharing', async (t) => {
+  const invalid = new ArtiError('ERR_ARTI_CONFIG', 'dataDir permissions changed')
+  const nativeStart = deferred()
+  let validationCalls = 0
+  const addon = observableAddon({
+    start: () => nativeStart.promise,
+    stop: () => Promise.resolve(),
+    matchesOptions() {
+      validationCalls++
+      throw invalid
+    }
+  })
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar: t.fail
+  })
+  const first = backend.start({ backend: 'addon', dataDir: '/private/state' })
+  const repeated = backend.start({ backend: 'addon', dataDir: '/private/state' })
+
+  t.is(await rejection(repeated), invalid)
+  t.is(validationCalls, 1)
+  nativeStart.resolve({ port: 19050, backend: 'addon', stop() {} })
   await first
 })
 
@@ -252,7 +327,7 @@ test('active addon prevents a sidecar spawn', async (t) => {
     platform: 'linux',
     arch: 'x64',
     loadAddon() {
-      return { start: () => addonStart.promise, stop() {} }
+      return { start: () => addonStart.promise, stop() {}, matchesOptions: () => true }
     },
     startSidecar() {
       sidecarCalls++
@@ -280,7 +355,8 @@ test('sidecar stop owns bootstrap settlement and backend switching', async (t) =
           addonStarts++
           return Promise.resolve({ port: 19051, backend: 'addon', stop() {} })
         },
-        stop() {}
+        stop() {},
+        matchesOptions: () => true
       }
     },
     startSidecar() {

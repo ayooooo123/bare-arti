@@ -349,6 +349,48 @@ test('matching starts share one promise and conflicting starts reject', async (t
   t.is(handle.port, 19050)
 })
 
+test('private option matching revalidates and compares canonical config', async (t) => {
+  let validationCalls = 0
+  let valid = true
+  const expected = artiError('ERR_ARTI_CONFIG', 'dataDir permissions changed')
+  const controller = createAddonController(
+    controllerOptions(
+      {
+        start: () => Promise.resolve({ port: 19050 }),
+        stop: () => Promise.resolve()
+      },
+      {
+        validateOptions(options) {
+          validationCalls++
+          if (!valid) throw expected
+          return Object.freeze({
+            backend: 'addon',
+            dataDir: path.resolve(options.dataDir),
+            timeout: options.timeout || 600000
+          })
+        },
+        setTimer: () => 1,
+        clearTimer() {}
+      }
+    )
+  )
+  const starting = controller.start({ dataDir: '/private/state' })
+
+  t.is(
+    controller.matchesOptions({ dataDir: '/private/parent/../state' }),
+    true,
+    'canonical-equivalent configuration matches'
+  )
+  t.is(validationCalls, 2, 'matching reruns validation')
+  valid = false
+  t.is(
+    captureError(() => controller.matchesOptions({ dataDir: '/private/state' })),
+    expected
+  )
+  t.is(validationCalls, 3, 'identical raw configuration is still revalidated')
+  await starting
+})
+
 test('timeout cancels native startup before rejecting all callers', async (t) => {
   const nativeStart = deferred()
   const nativeStop = deferred()
