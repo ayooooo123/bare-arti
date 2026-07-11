@@ -98,7 +98,7 @@ where
 
     let accept_task = tokio::spawn(async move {
         let mut connections = JoinSet::new();
-        let outcome = loop {
+        let mut outcome = loop {
             tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => break Ok(()),
@@ -109,11 +109,24 @@ where
                 }
                     Err(error) => break Err(anyhow!("accepting SOCKS connection: {error}")),
                 },
-                Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                Some(completed) = connections.join_next(), if !connections.is_empty() => {
+                    if let Err(error) = completed {
+                        break Err(anyhow!("SOCKS connection task failed: {error}"));
+                    }
+                }
             }
         };
+        // Stop accepting before connection destructors run. Cleanup may block
+        // or take time, but no new peer can enter once shutdown has begun.
+        drop(listener);
         connections.abort_all();
-        while connections.join_next().await.is_some() {}
+        while let Some(completed) = connections.join_next().await {
+            if let Err(error) = completed {
+                if !error.is_cancelled() && outcome.is_ok() {
+                    outcome = Err(anyhow!("SOCKS connection task failed: {error}"));
+                }
+            }
+        }
         let _ = terminal_tx.send(());
         outcome
     });
@@ -293,5 +306,69 @@ mod tests {
 
         tokio::task::block_in_place(|| joined.recv_timeout(Duration::from_secs(1))).unwrap();
         assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socks_service_closes_listener_before_connection_cleanup_finishes() {
+        struct BlockingCleanup {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Drop for BlockingCleanup {
+            fn drop(&mut self) {
+                let _ = self.started.send(());
+                let _ = self.release.recv();
+            }
+        }
+
+        let (handler_started_tx, handler_started) = mpsc::sync_channel(0);
+        let (cleanup_started_tx, cleanup_started) = mpsc::channel();
+        let (release_tx, release) = mpsc::sync_channel(0);
+        let cleanup = Arc::new(std::sync::Mutex::new(Some(BlockingCleanup {
+            started: cleanup_started_tx,
+            release,
+        })));
+        let (port, service) = serve_socks_with("127.0.0.1", move |_socket| {
+            let handler_started_tx = handler_started_tx.clone();
+            let cleanup = cleanup.lock().unwrap().take().unwrap();
+            async move {
+                let _cleanup = cleanup;
+                let _ = tokio::task::block_in_place(|| handler_started_tx.send(()));
+                std::future::pending::<()>().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _connection = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::task::block_in_place(|| handler_started.recv_timeout(Duration::from_secs(1)))
+            .unwrap();
+
+        let shutdown = tokio::spawn(service.shutdown());
+        tokio::task::block_in_place(|| cleanup_started.recv_timeout(Duration::from_secs(1)))
+            .unwrap();
+        let new_connection = TcpStream::connect(("127.0.0.1", port)).await;
+        release_tx.send(()).unwrap();
+
+        assert!(
+            new_connection.is_err(),
+            "listener closes before connection cleanup is released"
+        );
+        shutdown.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socks_service_surfaces_panicking_connection_task() {
+        let (port, mut service) = serve_socks_with("127.0.0.1", |_socket| async move {
+            panic!("injected connection panic")
+        })
+        .await
+        .unwrap();
+        let _connection = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+        service.wait().await.unwrap();
+        let error = service.shutdown().await.unwrap_err();
+
+        assert!(error.to_string().contains("panicked"));
     }
 }

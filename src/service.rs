@@ -307,26 +307,34 @@ fn prepare_data_dir(data_dir: &std::path::Path) -> Result<PathBuf, ServiceError>
         set_owner_only_permissions(data_dir)?;
     }
     let first = std::fs::symlink_metadata(data_dir).map_err(config_fs_error)?;
-    if first.file_type().is_symlink() || !first.is_dir() {
-        return Err(ServiceError::new(
-            "ERR_ARTI_CONFIG",
-            "dataDir must be a directory and not a symbolic link",
-        ));
-    }
-    ensure_owner_only_permissions(&first)?;
     let canonical = std::fs::canonicalize(data_dir).map_err(config_fs_error)?;
     let canonical_metadata = std::fs::metadata(&canonical).map_err(config_fs_error)?;
     let final_metadata = std::fs::symlink_metadata(data_dir).map_err(config_fs_error)?;
-    if final_metadata.file_type().is_symlink()
-        || !same_file(&first, &canonical_metadata)
-        || !same_file(&canonical_metadata, &final_metadata)
-    {
+    validate_data_dir_snapshots(&first, &canonical_metadata, &final_metadata)?;
+    Ok(canonical)
+}
+
+fn validate_data_dir_snapshots(
+    first: &std::fs::Metadata,
+    canonical: &std::fs::Metadata,
+    final_metadata: &std::fs::Metadata,
+) -> Result<(), ServiceError> {
+    for metadata in [first, canonical, final_metadata] {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ServiceError::new(
+                "ERR_ARTI_CONFIG",
+                "dataDir must be a directory and not a symbolic link",
+            ));
+        }
+        ensure_owner_only_permissions(metadata)?;
+    }
+    if !same_file(first, canonical) || !same_file(canonical, final_metadata) {
         return Err(ServiceError::new(
             "ERR_ARTI_CONFIG",
             "dataDir changed during native validation",
         ));
     }
-    Ok(canonical)
+    Ok(())
 }
 
 fn config_fs_error(error: std::io::Error) -> ServiceError {
@@ -1829,6 +1837,31 @@ mod tests {
         assert_eq!(worker.join().unwrap().unwrap_err(), error);
         assert_eq!(bootstrap_calls.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_rejects_insecure_canonical_or_final_metadata_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "bare-arti-late-metadata-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let secure = std::fs::symlink_metadata(&data_dir).unwrap();
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let insecure = std::fs::symlink_metadata(&data_dir).unwrap();
+
+        let canonical_error =
+            validate_data_dir_snapshots(&secure, &insecure, &insecure).unwrap_err();
+        assert_eq!(canonical_error.code, "ERR_ARTI_CONFIG");
+        let final_error = validate_data_dir_snapshots(&secure, &secure, &insecure).unwrap_err();
+        assert_eq!(final_error.code, "ERR_ARTI_CONFIG");
+
+        std::fs::remove_dir_all(data_dir).unwrap();
     }
 
     enum GateDecision {
