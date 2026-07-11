@@ -80,6 +80,14 @@ const tor = await arti.start({
 await tor.stop()
 ```
 
+Before `start()` resolves, the owning network worker cancels startup with:
+
+```js
+const starting = arti.start(options)
+await arti.stop()
+await starting // rejects with ERR_ARTI_CANCELLED
+```
+
 Contract rules:
 
 - `start()` always returns a promise.
@@ -95,6 +103,9 @@ Contract rules:
   service and resolves as an idempotent no-op.
 - `stop()` is idempotent, generation-tagged, and waits for the bootstrap thread
   or running service to terminate.
+- Module-level `arti.stop()` cancels the current `Starting` generation or stops
+  the current `Running` generation. The resolved handle's `stop()` delegates to
+  the same operation with its captured generation, making stale handles safe.
 - Stop during bootstrap rejects outstanding starts with a stable cancellation
   error. The configured timeout has the same global semantics: it requests
   cancellation, joins the worker, transitions to `Stopped`, and rejects every
