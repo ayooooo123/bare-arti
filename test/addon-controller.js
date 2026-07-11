@@ -3,8 +3,8 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
-const { validateAddonOptions } = require('../lib/addon-controller')
-const { ArtiError } = require('../lib/errors')
+const { createAddonController, validateAddonOptions } = require('../lib/addon-controller')
+const { ArtiError, artiError } = require('../lib/errors')
 
 const dependencies = (platform) => ({
   platform,
@@ -33,6 +33,43 @@ function captureError(fn) {
   }
 
   return error
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+
+  return { promise, resolve, reject }
+}
+
+async function rejection(promise) {
+  try {
+    await promise
+  } catch (error) {
+    return error
+  }
+
+  return null
+}
+
+function controllerOptions(binding, overrides = {}) {
+  return {
+    binding,
+    validateOptions(options) {
+      return Object.freeze({
+        backend: 'addon',
+        dataDir: options.dataDir,
+        timeout: options.timeout || 600000
+      })
+    },
+    setTimer: setTimeout,
+    clearTimer: clearTimeout,
+    ...overrides
+  }
 }
 
 test('valid Android addon options are normalized and frozen', (t) => {
@@ -267,4 +304,262 @@ test('filesystem failures preserve a stable ArtiError shape and cause', (t) => {
   t.is(error.name, 'ArtiError', 'uses the stable error name')
   t.is(error.code, 'ERR_ARTI_CONFIG', 'uses the stable error code')
   t.is(error.cause, original, 'preserves the original cause')
+})
+
+test('controller start always returns a promise on synchronous validation failure', async (t) => {
+  const expected = artiError('ERR_ARTI_CONFIG', 'invalid test config')
+  const controller = createAddonController(
+    controllerOptions(
+      { start: t.fail, stop: t.fail },
+      {
+        validateOptions() {
+          throw expected
+        }
+      }
+    )
+  )
+
+  const starting = controller.start({})
+  t.ok(starting instanceof Promise, 'returns a promise')
+  t.is(await rejection(starting), expected, 'rejects with the validation error')
+})
+
+test('matching starts share one promise and conflicting starts reject', async (t) => {
+  const nativeStart = deferred()
+  let startCalls = 0
+  const controller = createAddonController(
+    controllerOptions({
+      start() {
+        startCalls++
+        return nativeStart.promise
+      },
+      stop: t.fail
+    })
+  )
+  const first = controller.start({ dataDir: '/private/a', timeout: 1000 })
+  const matching = controller.start({ dataDir: '/private/a', timeout: 1000 })
+  const conflicting = controller.start({ dataDir: '/private/b', timeout: 1000 })
+
+  t.is(first, matching, 'returns the identical startup promise')
+  t.is(startCalls, 1, 'starts native once')
+  t.is((await rejection(conflicting)).code, 'ERR_ARTI_CONFIG_CONFLICT')
+
+  nativeStart.resolve({ port: 19050 })
+  const handle = await first
+  t.is(handle.port, 19050)
+})
+
+test('timeout cancels native startup before rejecting all callers', async (t) => {
+  const nativeStart = deferred()
+  const nativeStop = deferred()
+  let timeoutCallback = null
+  const stopGenerations = []
+  const controller = createAddonController(
+    controllerOptions(
+      {
+        start: () => nativeStart.promise,
+        stop(generation) {
+          stopGenerations.push(generation)
+          return nativeStop.promise
+        }
+      },
+      {
+        setTimer(callback, timeout) {
+          t.is(timeout, 1000, 'arms the configured timeout')
+          timeoutCallback = callback
+          return 1
+        },
+        clearTimer() {}
+      }
+    )
+  )
+  const first = controller.start({ dataDir: '/private/a', timeout: 1000 })
+  const matching = controller.start({ dataDir: '/private/a', timeout: 1000 })
+  const firstOutcome = rejection(first)
+
+  timeoutCallback()
+  t.alike(stopGenerations, [1], 'cancels the native generation once')
+
+  let settled = false
+  firstOutcome.then(() => (settled = true))
+  await Promise.resolve()
+  t.is(settled, false, 'waits for native stop to settle')
+
+  nativeStop.resolve()
+  t.is((await firstOutcome).code, 'ERR_ARTI_TIMEOUT')
+  t.is((await rejection(matching)).code, 'ERR_ARTI_TIMEOUT')
+
+  nativeStart.resolve({ port: 19050 })
+})
+
+test('a cleared queued timeout cannot stop a running generation', async (t) => {
+  let timeoutCallback = null
+  let stopCalls = 0
+  const controller = createAddonController(
+    controllerOptions(
+      {
+        start: async () => ({ port: 19050 }),
+        stop() {
+          stopCalls++
+          return Promise.resolve()
+        }
+      },
+      {
+        setTimer(callback) {
+          timeoutCallback = callback
+          return 1
+        },
+        clearTimer() {}
+      }
+    )
+  )
+
+  await controller.start({ dataDir: '/private/a' })
+  timeoutCallback()
+  await Promise.resolve()
+  t.is(stopCalls, 0, 'ignores a timeout callback after startup completed')
+})
+
+test('controller stop during startup cancels the generation', async (t) => {
+  const nativeStart = deferred()
+  const nativeStop = deferred()
+  let stopCalls = 0
+  const controller = createAddonController(
+    controllerOptions({
+      start: () => nativeStart.promise,
+      stop() {
+        stopCalls++
+        return nativeStop.promise
+      }
+    })
+  )
+  const starting = controller.start({ dataDir: '/private/a' })
+  const startingOutcome = rejection(starting)
+  const stopping = controller.stop()
+
+  t.is(stopCalls, 1, 'cancels native once')
+  nativeStop.resolve()
+  await stopping
+  t.is((await startingOutcome).code, 'ERR_ARTI_CANCELLED')
+  nativeStart.resolve({ port: 19050 })
+})
+
+test('matching handles share one stop operation', async (t) => {
+  const nativeStop = deferred()
+  let stopCalls = 0
+  const controller = createAddonController(
+    controllerOptions({
+      start: async () => ({ port: 19050 }),
+      stop() {
+        stopCalls++
+        return nativeStop.promise
+      }
+    })
+  )
+  const first = controller.start({ dataDir: '/private/a' })
+  const matching = controller.start({ dataDir: '/private/a' })
+  const firstHandle = await first
+  const matchingHandle = await matching
+
+  t.is(firstHandle, matchingHandle, 'matching starts resolve to one handle')
+  t.ok(Object.isFrozen(firstHandle), 'freezes the public handle')
+
+  const firstStop = firstHandle.stop()
+  const matchingStop = matchingHandle.stop()
+  const controllerStop = controller.stop()
+  t.is(firstStop, matchingStop, 'handle stops share one promise')
+  t.is(firstStop, controllerStop, 'controller stop shares that promise')
+  t.is(stopCalls, 1, 'stops native once')
+
+  nativeStop.resolve()
+  await firstStop
+})
+
+test('a stale handle cannot stop a restarted generation', async (t) => {
+  const nativeStarts = [deferred(), deferred()]
+  const nativeStops = [deferred(), deferred()]
+  const stoppedGenerations = []
+  const controller = createAddonController(
+    controllerOptions({
+      start(config, generation) {
+        return nativeStarts[generation - 1].promise
+      },
+      stop(generation) {
+        stoppedGenerations.push(generation)
+        return nativeStops[generation - 1].promise
+      }
+    })
+  )
+
+  const firstStart = controller.start({ dataDir: '/private/a' })
+  nativeStarts[0].resolve({ port: 19050 })
+  const firstHandle = await firstStart
+  const firstStop = firstHandle.stop()
+  nativeStops[0].resolve()
+  await firstStop
+
+  const secondStart = controller.start({ dataDir: '/private/a' })
+  nativeStarts[1].resolve({ port: 19051 })
+  const secondHandle = await secondStart
+  await firstHandle.stop()
+  t.alike(stoppedGenerations, [1], 'stale stop does not reach native')
+
+  const secondStop = secondHandle.stop()
+  nativeStops[1].resolve()
+  await secondStop
+  t.alike(stoppedGenerations, [1, 2])
+})
+
+test('stopping blocks restart and settles only after native stop', async (t) => {
+  const nativeStarts = [deferred(), deferred()]
+  const nativeStop = deferred()
+  let starts = 0
+  const controller = createAddonController(
+    controllerOptions({
+      start() {
+        return nativeStarts[starts++].promise
+      },
+      stop: () => nativeStop.promise
+    })
+  )
+  const starting = controller.start({ dataDir: '/private/a' })
+  nativeStarts[0].resolve({ port: 19050 })
+  const handle = await starting
+  const stopping = handle.stop()
+  let stopSettled = false
+  stopping.then(() => (stopSettled = true))
+
+  t.is(
+    (await rejection(controller.start({ dataDir: '/private/a' }))).code,
+    'ERR_ARTI_CANCELLED',
+    'rejects start while stopping'
+  )
+  await Promise.resolve()
+  t.is(stopSettled, false, 'stop remains pending with native')
+  t.is(starts, 1, 'does not restart early')
+
+  nativeStop.resolve()
+  await stopping
+  const restarted = controller.start({ dataDir: '/private/a' })
+  t.is(starts, 2, 'restarts only after native stop')
+  nativeStarts[1].resolve({ port: 19051 })
+  t.is((await restarted).port, 19051)
+})
+
+test('documented native errors are preserved and unknown failures map to bootstrap', async (t) => {
+  const documented = artiError('ERR_ARTI_BIND', 'bind failed')
+  const documentedController = createAddonController(
+    controllerOptions({ start: () => Promise.reject(documented), stop: t.fail })
+  )
+  const preserved = await rejection(documentedController.start({ dataDir: '/private/a' }))
+  t.is(preserved, documented, 'preserves the documented error object')
+
+  const unknown = new Error('native exploded')
+  const unknownController = createAddonController(
+    controllerOptions({ start: () => Promise.reject(unknown), stop: t.fail })
+  )
+  const mapped = await rejection(unknownController.start({ dataDir: '/private/a' }))
+  t.ok(mapped instanceof ArtiError)
+  t.is(mapped.code, 'ERR_ARTI_BOOTSTRAP')
+  t.is(mapped.cause, unknown)
 })
