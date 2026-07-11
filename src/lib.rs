@@ -23,6 +23,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tor_rtcompat::PreferredRuntime;
 
+pub mod service;
+
 // TorClient isn't Clone; share it across connections behind an Arc.
 pub type Client = Arc<TorClient<PreferredRuntime>>;
 
@@ -140,7 +142,10 @@ async fn handle_conn(client: Client, mut sock: TcpStream) -> Result<()> {
     let mut prefs = StreamPrefs::new();
     prefs.connect_to_onion_services(BoolOrAuto::Explicit(true));
 
-    match client.connect_with_prefs((host.as_str(), port), &prefs).await {
+    match client
+        .connect_with_prefs((host.as_str(), port), &prefs)
+        .await
+    {
         Ok(mut tor_stream) => {
             sock.write_all(&reply(0x00)).await?; // succeeded
             tokio::io::copy_bidirectional(&mut sock, &mut tor_stream).await?;
