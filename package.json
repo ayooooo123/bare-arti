@@ -21,7 +21,7 @@
     "verify": "cargo build --bin arti-socks && node test/launcher.js",
     "build:addon": "bare-make generate && bare-make build && bare-make install",
     "build:sidecar": "cargo build --release --bin arti-socks",
-    "test": "prettier --check . && node test/launcher.js"
+    "test": "prettier --check . && node test/all.js"
   },
   "dependencies": {
     "which-runtime": "^1.3.2"
