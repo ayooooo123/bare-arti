@@ -1,4 +1,4 @@
-// Loads the compiled Bare addon (in-process backend) from prebuilds/.
-// index.js requires this lazily and falls back to the sidecar binary if the
-// addon isn't present for the current platform.
+// Loads the compiled in-process Bare addon from prebuilds/. Mobile requires
+// this backend and fails closed when it is unavailable; desktop loads it only
+// when the addon backend is selected explicitly.
 module.exports = require.addon()
