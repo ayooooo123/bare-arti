@@ -801,3 +801,44 @@ test('documented native errors are preserved and unknown failures map to bootstr
   t.is(mapped.code, 'ERR_ARTI_BOOTSTRAP')
   t.is(mapped.cause, unknown)
 })
+
+test('private lifecycle observer reports confirmed stopped', async (t) => {
+  const nativeStop = deferred()
+  const controller = createAddonController(
+    controllerOptions({
+      start: async () => ({ port: 19050 }),
+      stop: () => nativeStop.promise
+    })
+  )
+  t.is(typeof controller.observeLifecycle, 'function')
+  if (typeof controller.observeLifecycle !== 'function') return
+  const events = []
+  controller.observeLifecycle((event) => events.push(event))
+  const handle = await controller.start({ dataDir: '/private/a' })
+  const stopping = handle.stop()
+  nativeStop.resolve()
+  await stopping
+
+  t.is(events.length, 1)
+  t.is(events[0].status, 'stopped')
+})
+
+test('private lifecycle observer reports terminal shutdown', async (t) => {
+  const shutdown = artiError('ERR_ARTI_SHUTDOWN', 'native stop failed')
+  const controller = createAddonController(
+    controllerOptions({
+      start: async () => ({ port: 19050 }),
+      stop: () => Promise.reject(shutdown)
+    })
+  )
+  t.is(typeof controller.observeLifecycle, 'function')
+  if (typeof controller.observeLifecycle !== 'function') return
+  const events = []
+  controller.observeLifecycle((event) => events.push(event))
+  const handle = await controller.start({ dataDir: '/private/a' })
+  await rejection(handle.stop())
+
+  t.is(events.length, 1)
+  t.is(events[0].status, 'failed')
+  t.is(events[0].error, shutdown)
+})

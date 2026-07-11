@@ -28,7 +28,8 @@ async function rejection(promise) {
   return null
 }
 
-function fakeChild(killResult = true) {
+function fakeChild(killResult) {
+  if (arguments.length === 0) killResult = true
   const child = new EventEmitter()
   child.stdout = new EventEmitter()
   child.killCalls = 0
@@ -50,6 +51,8 @@ function fakeSidecar(child, overrides = {}) {
     environment: {},
     setTimer: () => 1,
     clearTimer() {},
+    setShutdownTimer: () => 2,
+    clearShutdownTimer() {},
     ...overrides
   })
 }
@@ -246,6 +249,34 @@ test('unconfirmed sidecar kill rejects shutdown', async (t) => {
   t.is(child.killCalls, 1)
 })
 
+test('undefined Bare kill result waits for confirmed exit', async (t) => {
+  const child = fakeChild(undefined)
+  const operation = fakeSidecar(child)({ bin: '/fake/arti-socks' })
+  child.stdout.emit('data', Buffer.from('19050\n'))
+  const handle = await operation.promise
+  const stopping = handle.stop()
+  const stoppingOutcome = rejection(stopping)
+  let settled = false
+  stoppingOutcome.then(() => (settled = true))
+
+  t.is(child.killCalls, 1)
+  await Promise.resolve()
+  t.is(settled, false, 'undefined means signal delivery is not known to have failed')
+  child.emit('exit', 0)
+  t.is(await stoppingOutcome, null)
+})
+
+test('real Node ENOENT remains bootstrap and confirms no child', async (t) => {
+  const operation = startSidecar({
+    bin: path.join(os.tmpdir(), `bare-arti-does-not-exist-${process.pid}`),
+    timeout: 1000
+  })
+  const error = await rejection(operation.promise)
+
+  t.is(error.code, 'ERR_ARTI_BOOTSTRAP')
+  await operation.stopped
+})
+
 test('sidecar timeout is stable and cleanup-owned', async (t) => {
   const child = fakeChild()
   let timeoutCallback = null
@@ -336,19 +367,70 @@ test('post-spawn listener setup failure is stop-owned', async (t) => {
   t.is(error.cause, setupError)
 })
 
-test('sidecar removes startup listeners after success', async (t) => {
+test('sidecar removes startup data listener and retains runtime error handler', async (t) => {
   const child = fakeChild()
   const operation = fakeSidecar(child)({ bin: '/fake/arti-socks' })
   child.stdout.emit('data', Buffer.from('19050\n'))
   await operation.promise
 
   t.is(child.stdout.listenerCount('data'), 0)
-  t.is(child.listenerCount('error'), 0)
+  t.is(child.listenerCount('error'), 1)
   child.stdout.emit('data', Buffer.alloc(1024 * 1024))
 
   const stopping = operation.stop()
   child.emit('exit', 0)
   await stopping
+})
+
+test('runtime child error remains handled and terminal', async (t) => {
+  const child = fakeChild()
+  const operation = fakeSidecar(child)({ bin: '/fake/arti-socks' })
+  child.stdout.emit('data', Buffer.from('19050\n'))
+  await operation.promise
+  const runtimeError = new Error('runtime child failure')
+  const stoppedOutcome = rejection(operation.stopped)
+  let thrown = null
+  try {
+    child.emit('error', runtimeError)
+  } catch (error) {
+    thrown = error
+  }
+
+  t.is(thrown, null, 'runtime error remains observed')
+  if (thrown) return
+  t.is(child.killCalls, 1)
+  child.emit('exit', 1)
+  const error = await stoppedOutcome
+  t.is(error.code, 'ERR_ARTI_SHUTDOWN')
+  t.is(error.cause, runtimeError)
+})
+
+test('shutdown watchdog escalates then fails terminal without exit', async (t) => {
+  const child = fakeChild()
+  const watchdogs = []
+  const operation = fakeSidecar(child, {
+    shutdownTimeout: 25,
+    setShutdownTimer(callback, timeout) {
+      t.is(timeout, 25)
+      watchdogs.push(callback)
+      return watchdogs.length
+    },
+    clearShutdownTimer() {}
+  })({ bin: '/fake/arti-socks' })
+  child.stdout.emit('data', Buffer.from('19050\n'))
+  const handle = await operation.promise
+  const stopping = handle.stop()
+  const stopOutcome = rejection(stopping)
+
+  t.is(watchdogs.length, 1, 'arms confirmation watchdog')
+  if (watchdogs.length === 0) return
+  watchdogs[0]()
+  t.is(child.killCalls, 2, 'escalates once')
+  t.is(watchdogs.length, 2, 'arms final watchdog')
+  watchdogs[1]()
+  const error = await stopOutcome
+  t.is(error.code, 'ERR_ARTI_SHUTDOWN')
+  t.is((await rejection(operation.stopped)).code, 'ERR_ARTI_SHUTDOWN')
 })
 
 function restoreEnv(name, value) {

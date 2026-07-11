@@ -29,6 +29,21 @@ function sidecarOperation(starting, stopping = never) {
   return { promise: starting, stop: () => stopping, stopped: stopping }
 }
 
+function observableAddon({ start, stop }) {
+  const observers = new Set()
+  return {
+    start,
+    stop,
+    observeLifecycle(observer) {
+      observers.add(observer)
+      return () => observers.delete(observer)
+    },
+    emit(event) {
+      for (const observer of observers) observer(event)
+    }
+  }
+}
+
 for (const platform of ['android', 'ios']) {
   test(`${platform} requires the addon and never falls back to sidecar`, async (t) => {
     let sidecarCalls = 0
@@ -382,5 +397,85 @@ test('start null rejects a promise config error', async (t) => {
 
   t.ok(starting instanceof Promise)
   t.is((await rejection(starting)).code, 'ERR_ARTI_CONFIG')
+  t.is(sidecarCalls, 0)
+})
+
+test('rejected addon startup cleans ownership before sidecar', async (t) => {
+  const bootstrap = new Error('addon bootstrap failed')
+  let sidecarCalls = 0
+  let addon
+  addon = observableAddon({
+    start: () => Promise.reject(bootstrap),
+    stop() {
+      addon.emit({ status: 'stopped' })
+      return Promise.resolve()
+    }
+  })
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar() {
+      sidecarCalls++
+      return sidecarOperation(Promise.resolve({ port: 19051, backend: 'sidecar', stop() {} }))
+    }
+  })
+
+  await rejection(backend.start({ backend: 'addon', dataDir: '/private/a' }))
+  await Promise.resolve()
+  const started = await backend.start({ dataDir: '/private/a' })
+  t.is(started && started.port, 19051)
+  t.is(sidecarCalls, 1)
+})
+
+test('direct addon handle stop releases backend ownership', async (t) => {
+  let addon
+  addon = observableAddon({
+    start: () =>
+      Promise.resolve({
+        port: 19050,
+        backend: 'addon',
+        stop() {
+          addon.emit({ status: 'stopped' })
+          return Promise.resolve()
+        }
+      }),
+    stop: () => Promise.resolve()
+  })
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar: () =>
+      sidecarOperation(Promise.resolve({ port: 19051, backend: 'sidecar', stop() {} }))
+  })
+  const handle = await backend.start({ backend: 'addon', dataDir: '/private/a' })
+  await handle.stop()
+  await Promise.resolve()
+
+  t.is((await backend.start({ dataDir: '/private/a' })).port, 19051)
+})
+
+test('terminal addon lifecycle blocks every backend', async (t) => {
+  const shutdown = new ArtiError('ERR_ARTI_SHUTDOWN', 'terminal addon failure')
+  let addon
+  addon = observableAddon({
+    start: () => Promise.resolve({ port: 19050, backend: 'addon', stop() {} }),
+    stop: () => Promise.reject(shutdown)
+  })
+  let sidecarCalls = 0
+  const backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: () => addon,
+    startSidecar() {
+      sidecarCalls++
+    }
+  })
+  await backend.start({ backend: 'addon', dataDir: '/private/a' })
+  addon.emit({ status: 'failed', error: shutdown })
+
+  const error = await rejection(backend.start({ dataDir: '/private/a' }))
+  t.is(error && error.code, 'ERR_ARTI_SHUTDOWN')
   t.is(sidecarCalls, 0)
 })
