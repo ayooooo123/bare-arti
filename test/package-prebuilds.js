@@ -75,6 +75,7 @@ function assemblySource(t) {
     'addon/src',
     'src',
     'lib',
+    'scripts/assemble-package.js',
     'scripts/verify-package-prebuilds.js'
   ]) {
     fs.cpSync(path.join(repository, relative), path.join(source, relative), { recursive: true })
@@ -209,4 +210,19 @@ test('assembly rejects non-Git, mismatched SHA, and dirty package source', (t) =
       assemblePackage(untracked.source, path.join(untracked.source, 'stage'), untracked.sourceSha),
     /source is dirty/
   )
+})
+
+test('clean committed checkout assembles through the exact CI CLI invocation', (t) => {
+  const { source, sourceSha } = assemblySource(t)
+  const destination = path.join(os.tmpdir(), `bare-arti-cli-stage-${process.pid}-${Date.now()}`)
+  t.teardown(() => fs.rmSync(destination, { recursive: true, force: true }))
+
+  const output = execFileSync(process.execPath, ['scripts/assemble-package.js', destination], {
+    cwd: source,
+    encoding: 'utf8',
+    env: { ...process.env, GITHUB_SHA: sourceSha, BARE_ARTI_SOURCE_SHA: sourceSha }
+  })
+  t.is(output.trim(), destination)
+  t.ok(fs.existsSync(path.join(destination, 'prebuilds/provenance.json')))
+  t.absent(JSON.parse(fs.readFileSync(path.join(destination, 'package.json'))).private)
 })

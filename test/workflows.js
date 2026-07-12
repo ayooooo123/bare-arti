@@ -14,6 +14,8 @@ test('release workflow requires exact mobile inputs and verified package staging
     'node scripts/verify-package-prebuilds.js',
     'node scripts/assemble-package.js publication-stage',
     'BARE_ARTI_SOURCE_SHA="$GITHUB_SHA" npm pack',
+    'sort -o expected-prebuilds.txt expected-prebuilds.txt',
+    'sort -o expected-package-prebuilds.txt expected-package-prebuilds.txt',
     'prebuilds/android-arm64/bare-arti.bare',
     'prebuilds/ios-arm64/bare-arti.bare',
     'prebuilds/ios-arm64-simulator/bare-arti.bare'
@@ -37,5 +39,14 @@ test('workflow actions are immutable and permissions are read-only', (t) => {
       if (match[1].startsWith('./')) continue
       t.ok(/@[a-f0-9]{40}$/.test(match[1]), `pinned action ${match[1]}`)
     }
+    const checkouts = [...workflow.matchAll(/uses: actions\/checkout@/g)].length
+    const hardened = [
+      ...workflow.matchAll(
+        /uses: actions\/checkout@[^\n]+\n\s+with:\n\s+persist-credentials: false/g
+      )
+    ].length
+    t.is(hardened, checkouts, 'every checkout disables persisted credentials')
   }
+  const release = prebuild.slice(prebuild.indexOf('\n  release:'))
+  t.absent(release.match(/actions\/checkout/), 'release job stays checkout-free')
 })

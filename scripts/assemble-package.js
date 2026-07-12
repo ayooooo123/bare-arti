@@ -97,7 +97,7 @@ if (require.main === module) {
     ) {
       throw new Error('GITHUB_SHA and BARE_ARTI_SOURCE_SHA disagree')
     }
-    const sourceSha = positionalSha || environmentSha
+    const sourceSha = environmentSha
     if (!destination || !sourceSha) {
       throw new Error(
         'usage: assemble-package <destination> with GITHUB_SHA or BARE_ARTI_SOURCE_SHA'
