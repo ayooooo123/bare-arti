@@ -198,6 +198,11 @@ manifest; developers should not hand-author it or publish from an accumulated
 local `prebuilds/` directory. The staged package retains the `prepack` check as
 defense in depth.
 
+Addon provenance accepts only `prebuilds/<target>/bare-arti.bare` for the
+explicit tier-1 target set: Linux x64/arm64, macOS x64/arm64, Windows x64,
+Android arm64, iOS arm64, and iOS Simulator arm64. Arbitrary basenames, nested
+paths, target/path mismatches, and unsupported targets are rejected.
+
 ## Status / what's verified here
 
 - ✅ The Arti core (`src/lib.rs`, `arti-socks` bin) **compiles and runs** — it

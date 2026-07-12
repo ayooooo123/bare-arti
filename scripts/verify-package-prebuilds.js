@@ -14,6 +14,16 @@ const REQUIRED_SIDECARS = new Map([
   ['darwin-arm64', 'prebuilds/darwin-arm64/arti-socks'],
   ['win32-x64', 'prebuilds/win32-x64/arti-socks.exe']
 ])
+const SUPPORTED_ADDON_TARGETS = new Set([
+  'linux-x64',
+  'linux-arm64',
+  'darwin-x64',
+  'darwin-arm64',
+  'win32-x64',
+  'android-arm64',
+  'ios-arm64',
+  'ios-arm64-simulator'
+])
 
 function slash(relative) {
   return relative.split(path.sep).join('/')
@@ -93,11 +103,22 @@ function verifyPackagePrebuilds(packageRoot, expectedSourceSha) {
       typeof artifact.target !== 'string' ||
       (artifact.kind !== 'sidecar' && artifact.kind !== 'addon') ||
       typeof artifact.path !== 'string' ||
-      !/^prebuilds\/[a-z0-9-]+\/[a-z0-9.-]+$/.test(artifact.path) ||
-      !/^[a-f0-9]{64}$/.test(artifact.sha256) ||
-      artifact.path.split('/')[1] !== artifact.target
+      !/^prebuilds\/[a-z0-9-]+\/(?:[a-z0-9.-]+\/)*[a-z0-9.-]+$/.test(artifact.path) ||
+      !/^[a-f0-9]{64}$/.test(artifact.sha256)
     ) {
       throw new Error('invalid prebuild provenance artifact entry')
+    }
+    if (
+      artifact.kind === 'addon' &&
+      (!SUPPORTED_ADDON_TARGETS.has(artifact.target) ||
+        artifact.path !== `prebuilds/${artifact.target}/bare-arti.bare`)
+    ) {
+      throw new Error(`invalid addon artifact target or path: ${artifact.target} ${artifact.path}`)
+    }
+    if (artifact.kind === 'sidecar' && REQUIRED_SIDECARS.get(artifact.target) !== artifact.path) {
+      throw new Error(
+        `invalid sidecar artifact target or path: ${artifact.target} ${artifact.path}`
+      )
     }
     if (paths.has(artifact.path)) throw new Error(`duplicate artifact path: ${artifact.path}`)
     paths.add(artifact.path)
@@ -167,4 +188,10 @@ if (require.main === module) {
   }
 }
 
-module.exports = { ABI_VERSION, CAPABILITIES, REQUIRED_SIDECARS, verifyPackagePrebuilds }
+module.exports = {
+  ABI_VERSION,
+  CAPABILITIES,
+  REQUIRED_SIDECARS,
+  SUPPORTED_ADDON_TARGETS,
+  verifyPackagePrebuilds
+}

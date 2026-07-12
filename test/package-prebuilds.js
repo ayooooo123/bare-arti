@@ -103,6 +103,32 @@ test('package provenance requires every production sidecar and current addon met
   t.exception(() => verifyPackagePrebuilds(oldAddon, SOURCE_SHA), /addon ABI/)
 })
 
+for (const [name, target, addonPath] of [
+  ['wrong basename', 'darwin-arm64', 'prebuilds/darwin-arm64/not-bare-arti.bare'],
+  ['nested path', 'darwin-arm64', 'prebuilds/darwin-arm64/nested/bare-arti.bare'],
+  ['unsupported target', 'solaris-sparc', 'prebuilds/solaris-sparc/bare-arti.bare'],
+  ['target mismatch', 'linux-x64', 'prebuilds/darwin-arm64/bare-arti.bare']
+]) {
+  test(`package provenance rejects addon ${name}`, (t) => {
+    const root = fixture(t)
+    const provenanceFile = path.join(root, 'prebuilds/provenance.json')
+    const provenance = JSON.parse(fs.readFileSync(provenanceFile))
+    const addon = provenance.artifacts.find((entry) => entry.kind === 'addon')
+    const oldFile = path.join(root, addon.path)
+    const newFile = path.join(root, addonPath)
+    if (oldFile !== newFile) {
+      fs.mkdirSync(path.dirname(newFile), { recursive: true })
+      fs.renameSync(oldFile, newFile)
+    }
+    addon.target = target
+    addon.path = addonPath
+    addon.sha256 = sha256(newFile)
+    fs.writeFileSync(provenanceFile, JSON.stringify(provenance))
+
+    t.exception(() => verifyPackagePrebuilds(root, SOURCE_SHA), /addon artifact/)
+  })
+}
+
 test('verified assembly is the only package metadata that includes prebuilds', (t) => {
   const source = fixture(t)
   const repository = path.join(__dirname, '..')
