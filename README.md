@@ -187,7 +187,7 @@ reachability.
 The source checkout is marked `private` and its package allowlist excludes
 `prebuilds/`, so direct packing cannot capture accumulated local binaries and
 direct npm publication is refused even when lifecycle scripts are disabled.
-`npm run assemble:package -- <empty-destination> <full-source-sha>` is the only
+`GITHUB_SHA=<full-source-sha> npm run assemble:package -- <empty-destination>` is the only
 path that creates non-private publication metadata and adds prebuilds to the
 allowlist. It first runs a fail-closed verifier. A publishable staging tree must
 contain `prebuilds/provenance.json` tied to the full source commit,

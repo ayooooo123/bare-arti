@@ -46,7 +46,11 @@ test('native addon binding requires the exact ABI and capability handshake', (t)
     start() {},
     stop() {}
   })
-  t.is(validateAddonBinding(current), current)
+  const validated = validateAddonBinding(current)
+  t.not(validated, current)
+  t.ok(Object.isFrozen(validated))
+  t.is(validated.start, current.start)
+  t.is(validated.stop, current.stop)
 
   for (const binding of [
     null,
@@ -55,6 +59,48 @@ test('native addon binding requires the exact ABI and capability handshake', (t)
     { ...current, abiVersion: 3 },
     { ...current, capabilities: '' },
     { ...current, capabilities: 'reachableAddresses,unknown' }
+  ]) {
+    const error = captureError(() => validateAddonBinding(binding))
+    t.is(error && error.code, 'ERR_ARTI_ADDON_INCOMPATIBLE')
+  }
+})
+
+test('native addon handshake snapshots getters exactly once into an immutable facade', (t) => {
+  const reads = { abiVersion: 0, capabilities: 0, start: 0, stop: 0 }
+  const originalStart = () => 'start'
+  const originalStop = () => 'stop'
+  const binding = {}
+  for (const [name, value] of [
+    ['abiVersion', 2],
+    ['capabilities', 'reachableAddresses'],
+    ['start', originalStart],
+    ['stop', originalStop]
+  ]) {
+    Object.defineProperty(binding, name, {
+      get() {
+        reads[name]++
+        return reads[name] === 1 ? value : null
+      }
+    })
+  }
+
+  const facade = validateAddonBinding(binding)
+  t.alike(reads, { abiVersion: 1, capabilities: 1, start: 1, stop: 1 })
+  t.is(facade.start, originalStart)
+  t.is(facade.stop, originalStop)
+  t.ok(Object.isFrozen(facade))
+})
+
+test('native addon handshake maps revoked and throwing metadata to incompatibility', (t) => {
+  const revoked = Proxy.revocable({}, {})
+  revoked.revoke()
+  for (const binding of [
+    revoked.proxy,
+    Object.defineProperty({}, 'abiVersion', {
+      get() {
+        throw new Error('hostile getter')
+      }
+    })
   ]) {
     const error = captureError(() => validateAddonBinding(binding))
     t.is(error && error.code, 'ERR_ARTI_ADDON_INCOMPATIBLE')

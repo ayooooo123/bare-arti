@@ -87,17 +87,31 @@ jobs:
 
           tar -czf "sidecar-${PLATFORM}-${ARCH}.tar.gz" \
             -C prebuilds "${PLATFORM}-${ARCH}"
+          mkdir -p artifact-metadata
+          ARTIFACT_PATH="prebuilds/${PLATFORM}-${ARCH}/arti-socks"
+          if [[ "$PLATFORM" == 'win32' ]]; then ARTIFACT_PATH="${ARTIFACT_PATH}.exe"; fi
+          export ARTIFACT_PATH TARGET="${PLATFORM}-${ARCH}"
+          node -e "const c=require('crypto'),f=require('fs'),p=process.env.ARTIFACT_PATH,sha256=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('artifact-metadata/'+process.env.TARGET+'.json',JSON.stringify({schemaVersion:1,sourceSha:process.env.GITHUB_SHA,target:process.env.TARGET,kind:'sidecar',path:p,sha256,addonAbiVersion:2,capabilities:['reachableAddresses']})+'\n')"
 
       - name: Upload archived prebuild
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sidecar-${{ matrix.platform }}-${{ matrix.arch }}
-          path: sidecar-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+          path: |
+            sidecar-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
+            artifact-metadata/${{ matrix.platform }}-${{ matrix.arch }}.json
           if-no-files-found: error
+
+  mobile:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/mobile.yml
 
   assemble:
     name: Assemble release bundle
-    needs: sidecar
+    needs:
+      - sidecar
+      - mobile
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -117,7 +131,7 @@ jobs:
           test "$GITHUB_REF_NAME" = "$expected"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Test exact release source
         run: npm test
@@ -129,6 +143,12 @@ jobs:
           path: downloaded-sidecars
           merge-multiple: true
 
+      - name: Download exact mobile release inputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mobile-release-input
+          path: mobile-release-input
+
       - name: Assemble and verify prebuilds
         shell: bash
         run: |
@@ -136,6 +156,11 @@ jobs:
           mkdir -p prebuilds platform-archives
 
           printf '%s\n' \
+            downloaded-sidecars/artifact-metadata/darwin-arm64.json \
+            downloaded-sidecars/artifact-metadata/darwin-x64.json \
+            downloaded-sidecars/artifact-metadata/linux-arm64.json \
+            downloaded-sidecars/artifact-metadata/linux-x64.json \
+            downloaded-sidecars/artifact-metadata/win32-x64.json \
             downloaded-sidecars/sidecar-darwin-arm64.tar.gz \
             downloaded-sidecars/sidecar-darwin-x64.tar.gz \
             downloaded-sidecars/sidecar-linux-arm64.tar.gz \
@@ -149,6 +174,10 @@ jobs:
             cp "$archive" platform-archives/
             tar -xzf "$archive" -C prebuilds
           done
+          cp -R mobile-release-input/prebuilds/. prebuilds/
+          mkdir -p artifact-metadata
+          cp downloaded-sidecars/artifact-metadata/*.json artifact-metadata/
+          cp mobile-release-input/artifact-metadata/*.json artifact-metadata/
 
           chmod 755 \
             prebuilds/linux-x64/arti-socks \
@@ -157,10 +186,13 @@ jobs:
             prebuilds/darwin-arm64/arti-socks
 
           printf '%s\n' \
+            prebuilds/android-arm64/bare-arti.bare \
             prebuilds/darwin-arm64/arti-socks \
             prebuilds/darwin-x64/arti-socks \
             prebuilds/linux-arm64/arti-socks \
             prebuilds/linux-x64/arti-socks \
+            prebuilds/ios-arm64-simulator/bare-arti.bare \
+            prebuilds/ios-arm64/bare-arti.bare \
             prebuilds/win32-x64/arti-socks.exe > expected-prebuilds.txt
           find prebuilds -type f | sort > actual-prebuilds.txt
           diff -u expected-prebuilds.txt actual-prebuilds.txt
@@ -170,13 +202,42 @@ jobs:
           test -x prebuilds/darwin-x64/arti-socks
           test -x prebuilds/darwin-arm64/arti-socks
 
+          test "$(find artifact-metadata -type f | wc -l | tr -d ' ')" = 8
+          export BARE_ARTI_SOURCE_SHA="$GITHUB_SHA"
+          node - <<'NODE'
+          const fs = require('fs')
+          const path = require('path')
+          const metadata = fs.readdirSync('artifact-metadata').sort().map((name) =>
+            JSON.parse(fs.readFileSync(path.join('artifact-metadata', name), 'utf8'))
+          )
+          if (metadata.length !== 8) throw new Error('expected eight artifact metadata records')
+          for (const entry of metadata) {
+            if (entry.sourceSha !== process.env.GITHUB_SHA || entry.addonAbiVersion !== 2 ||
+                JSON.stringify(entry.capabilities) !== JSON.stringify(['reachableAddresses'])) {
+              throw new Error('artifact metadata source or ABI mismatch')
+            }
+          }
+          const artifacts = metadata.map(({ target, kind, path, sha256 }) => ({ target, kind, path, sha256 }))
+          fs.writeFileSync('prebuilds/provenance.json', JSON.stringify({
+            schemaVersion: 1,
+            sourceSha: process.env.GITHUB_SHA,
+            addonAbiVersion: 2,
+            capabilities: ['reachableAddresses'],
+            artifacts
+          }) + '\n')
+          NODE
+          node scripts/verify-package-prebuilds.js
+          node scripts/assemble-package.js publication-stage
+
       - name: Pack and inspect npm tarball
         shell: bash
         run: |
           set -euxo pipefail
-          npm pack --json > pack-result.json
+          cd publication-stage
+          BARE_ARTI_SOURCE_SHA="$GITHUB_SHA" npm pack --json > ../pack-result.json
+          cd ..
           package_tarball="$(node -e \
-            "process.stdout.write(require('./pack-result.json')[0].filename)")"
+            "process.stdout.write('publication-stage/'+require('./pack-result.json')[0].filename)")"
           mkdir package-check
           tar -xzf "$package_tarball" -C package-check
 
@@ -185,6 +246,10 @@ jobs:
             package-check/package/prebuilds/darwin-x64/arti-socks \
             package-check/package/prebuilds/linux-arm64/arti-socks \
             package-check/package/prebuilds/linux-x64/arti-socks \
+            package-check/package/prebuilds/android-arm64/bare-arti.bare \
+            package-check/package/prebuilds/ios-arm64-simulator/bare-arti.bare \
+            package-check/package/prebuilds/ios-arm64/bare-arti.bare \
+            package-check/package/prebuilds/provenance.json \
             package-check/package/prebuilds/win32-x64/arti-socks.exe \
             > expected-package-prebuilds.txt
           find package-check/package/prebuilds -type f | sort \
@@ -237,5 +302,5 @@ jobs:
             release-bundle/*.tar.gz \
             --clobber
 
-# Android and iOS addon cross-builds live in mobile.yml. They remain separate
-# from this publishable desktop-sidecar bundle until runtime/device proofs pass.
+# mobile.yml is invoked as a reusable, read-only build. Release assembly cannot
+# run unless all three architecture-checked mobile addons succeed.

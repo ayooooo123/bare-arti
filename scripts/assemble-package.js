@@ -2,6 +2,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const { execFileSync } = require('child_process')
 
 const { verifyPackagePrebuilds } = require('./verify-package-prebuilds')
 
@@ -25,9 +26,39 @@ const COPY = [
   'prebuilds'
 ]
 
-function assemblePackage(sourceRoot, destinationRoot, sourceSha) {
+function repositorySourceSha(root, expectedSourceSha) {
+  if (!/^[a-f0-9]{40}$/.test(expectedSourceSha || '')) {
+    throw new Error('a full lowercase CI source SHA is required')
+  }
+  let head
+  let status
+  try {
+    head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim()
+    status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: root,
+      encoding: 'utf8'
+    })
+  } catch (error) {
+    throw new Error(`package source must be a Git checkout: ${error.message}`)
+  }
+  if (head !== expectedSourceSha) throw new Error('CI source SHA does not match Git HEAD')
+
+  const relevant =
+    /^(?:index\.js|binding\.[cj]s|Cargo\.(?:toml|lock)|CMakeLists\.txt|package(?:-lock)?\.json|README\.md|LICENSE|addon\/|src\/|lib\/|scripts\/)/
+  for (const line of status.split('\n')) {
+    if (line === '') continue
+    const file = line.slice(3).replace(/^"|"$/g, '')
+    if (line.slice(0, 2) !== '??' || relevant.test(file)) {
+      throw new Error(`package source is dirty: ${file}`)
+    }
+  }
+  return head
+}
+
+function assemblePackage(sourceRoot, destinationRoot, expectedSourceSha) {
   const source = path.resolve(sourceRoot)
   const destination = path.resolve(destinationRoot)
+  const sourceSha = repositorySourceSha(source, expectedSourceSha)
   verifyPackagePrebuilds(source, sourceSha)
   if (fs.existsSync(destination)) {
     throw new Error(`package assembly destination already exists: ${destination}`)
@@ -56,9 +87,21 @@ function assemblePackage(sourceRoot, destinationRoot, sourceSha) {
 
 if (require.main === module) {
   try {
-    const [, , destination, sourceSha = process.env.BARE_ARTI_SOURCE_SHA] = process.argv
+    const [, , destination, unexpectedArgument] = process.argv
+    if (unexpectedArgument) throw new Error('source SHA must come from the CI environment')
+    const environmentSha = process.env.GITHUB_SHA || process.env.BARE_ARTI_SOURCE_SHA
+    if (
+      process.env.GITHUB_SHA &&
+      process.env.BARE_ARTI_SOURCE_SHA &&
+      process.env.GITHUB_SHA !== process.env.BARE_ARTI_SOURCE_SHA
+    ) {
+      throw new Error('GITHUB_SHA and BARE_ARTI_SOURCE_SHA disagree')
+    }
+    const sourceSha = positionalSha || environmentSha
     if (!destination || !sourceSha) {
-      throw new Error('usage: assemble-package <destination> <full-source-sha>')
+      throw new Error(
+        'usage: assemble-package <destination> with GITHUB_SHA or BARE_ARTI_SOURCE_SHA'
+      )
     }
     console.log(assemblePackage(path.resolve(__dirname, '..'), destination, sourceSha))
   } catch (error) {
@@ -67,4 +110,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { assemblePackage }
+module.exports = { assemblePackage, repositorySourceSha }

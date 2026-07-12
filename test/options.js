@@ -100,6 +100,18 @@ test('reachableAddresses elements are snapshotted exactly once', (t) => {
   t.alike(resolved.reachableAddresses, ['*:443'])
 })
 
+for (const length of [Symbol('length'), NaN, -1, 1.5, 65]) {
+  test(`adversarial reachableAddresses length ${String(length)} fails stably`, (t) => {
+    const value = new Proxy(['*:443'], {
+      get(target, property, receiver) {
+        if (property === 'length') return length
+        return Reflect.get(target, property, receiver)
+      }
+    })
+    configError(t, () => resolver('linux').beginGeneration()({ reachableAddresses: value }))
+  })
+}
+
 for (const platform of ['android', 'ios', 'ios-simulator']) {
   test(`${platform} requires a dataDir for its default addon`, (t) => {
     const resolve = resolver(platform).beginGeneration()

@@ -3,6 +3,7 @@ const crypto = require('crypto')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { execFileSync } = require('child_process')
 
 const { verifyPackagePrebuilds } = require('../scripts/verify-package-prebuilds')
 const { assemblePackage } = require('../scripts/assemble-package')
@@ -53,6 +54,46 @@ function fixture(t, { addon = true } = {}) {
     })
   )
   return root
+}
+
+function assemblySource(t) {
+  const source = fixture(t)
+  const repository = path.join(__dirname, '..')
+  for (const relative of [
+    'index.js',
+    'binding.c',
+    'binding.js',
+    'Cargo.toml',
+    'Cargo.lock',
+    'CMakeLists.txt',
+    'LICENSE',
+    'README.md',
+    'package.json',
+    'package-lock.json',
+    'addon/Cargo.toml',
+    'addon/Cargo.lock',
+    'addon/src',
+    'src',
+    'lib',
+    'scripts/verify-package-prebuilds.js'
+  ]) {
+    fs.cpSync(path.join(repository, relative), path.join(source, relative), { recursive: true })
+  }
+  fs.writeFileSync(path.join(source, '.gitignore'), 'prebuilds/\n')
+  execFileSync('git', ['init', '-q'], { cwd: source })
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: source })
+  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: source })
+  execFileSync('git', ['add', '.'], { cwd: source })
+  execFileSync('git', ['commit', '-qm', 'fixture'], { cwd: source })
+  const sourceSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: source,
+    encoding: 'utf8'
+  }).trim()
+  const provenanceFile = path.join(source, 'prebuilds/provenance.json')
+  const provenance = JSON.parse(fs.readFileSync(provenanceFile))
+  provenance.sourceSha = sourceSha
+  fs.writeFileSync(provenanceFile, JSON.stringify(provenance))
+  return { source, sourceSha }
 }
 
 test('package provenance accepts exact-source sidecars and current addons', (t) => {
@@ -130,32 +171,11 @@ for (const [name, target, addonPath] of [
 }
 
 test('verified assembly is the only package metadata that includes prebuilds', (t) => {
-  const source = fixture(t)
-  const repository = path.join(__dirname, '..')
-  for (const relative of [
-    'index.js',
-    'binding.c',
-    'binding.js',
-    'Cargo.toml',
-    'Cargo.lock',
-    'CMakeLists.txt',
-    'LICENSE',
-    'README.md',
-    'package.json',
-    'package-lock.json',
-    'addon/Cargo.toml',
-    'addon/Cargo.lock',
-    'addon/src',
-    'src',
-    'lib',
-    'scripts/verify-package-prebuilds.js'
-  ]) {
-    fs.cpSync(path.join(repository, relative), path.join(source, relative), { recursive: true })
-  }
+  const { source, sourceSha } = assemblySource(t)
   const destination = path.join(os.tmpdir(), `bare-arti-assembled-${process.pid}-${Date.now()}`)
   t.teardown(() => fs.rmSync(destination, { recursive: true, force: true }))
 
-  assemblePackage(source, destination, SOURCE_SHA)
+  assemblePackage(source, destination, sourceSha)
   const sourcePackage = require('../package.json')
   const assembledPackage = JSON.parse(fs.readFileSync(path.join(destination, 'package.json')))
   t.is(sourcePackage.private, true)
@@ -163,4 +183,30 @@ test('verified assembly is the only package metadata that includes prebuilds', (
   t.absent(assembledPackage.private)
   t.ok(assembledPackage.files.includes('prebuilds/**'))
   t.ok(fs.existsSync(path.join(destination, 'prebuilds/provenance.json')))
+})
+
+test('assembly rejects non-Git, mismatched SHA, and dirty package source', (t) => {
+  const nonGit = fixture(t)
+  t.exception(() => assemblePackage(nonGit, path.join(nonGit, 'stage'), SOURCE_SHA), /Git checkout/)
+
+  const mismatch = assemblySource(t)
+  t.exception(
+    () => assemblePackage(mismatch.source, path.join(mismatch.source, 'stage'), 'b'.repeat(40)),
+    /does not match/
+  )
+
+  const dirty = assemblySource(t)
+  fs.appendFileSync(path.join(dirty.source, 'lib/options.js'), '\n// dirty\n')
+  t.exception(
+    () => assemblePackage(dirty.source, path.join(dirty.source, 'stage'), dirty.sourceSha),
+    /source is dirty/
+  )
+
+  const untracked = assemblySource(t)
+  fs.writeFileSync(path.join(untracked.source, 'lib/untracked.js'), 'untracked\n')
+  t.exception(
+    () =>
+      assemblePackage(untracked.source, path.join(untracked.source, 'stage'), untracked.sourceSha),
+    /source is dirty/
+  )
 })

@@ -9,6 +9,7 @@ on:
       - main
       - 'feature/**'
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -129,6 +130,8 @@ jobs:
 
           mkdir -p manifests
           node -e "const c=require('crypto'),f=require('fs');const p='prebuilds/android-arm64/bare-arti.bare';const h=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('manifests/android-arm64.json',JSON.stringify({[p]:h})+'\\n')"
+          mkdir -p artifact-metadata
+          node -e "const c=require('crypto'),f=require('fs'),p='prebuilds/android-arm64/bare-arti.bare',sha256=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('artifact-metadata/android-arm64.json',JSON.stringify({schemaVersion:1,sourceSha:process.env.GITHUB_SHA,target:'android-arm64',kind:'addon',path:p,sha256,addonAbiVersion:2,capabilities:['reachableAddresses']})+'\\n')"
           sha256sum Cargo.lock addon/Cargo.lock > lockfiles.after
           diff -u lockfiles.before lockfiles.after
 
@@ -139,6 +142,7 @@ jobs:
           path: |
             prebuilds/android-arm64/bare-arti.bare
             manifests/android-arm64.json
+            artifact-metadata/android-arm64.json
           if-no-files-found: error
 
   ios-arm64:
@@ -201,6 +205,8 @@ jobs:
 
           mkdir -p manifests
           node -e "const c=require('crypto'),f=require('fs');const p='prebuilds/ios-arm64/bare-arti.bare';const h=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('manifests/ios-arm64.json',JSON.stringify({[p]:h})+'\\n')"
+          mkdir -p artifact-metadata
+          node -e "const c=require('crypto'),f=require('fs'),p='prebuilds/ios-arm64/bare-arti.bare',sha256=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('artifact-metadata/ios-arm64.json',JSON.stringify({schemaVersion:1,sourceSha:process.env.GITHUB_SHA,target:'ios-arm64',kind:'addon',path:p,sha256,addonAbiVersion:2,capabilities:['reachableAddresses']})+'\\n')"
           shasum -a 256 Cargo.lock addon/Cargo.lock > lockfiles.after
           diff -u lockfiles.before lockfiles.after
 
@@ -211,6 +217,7 @@ jobs:
           path: |
             prebuilds/ios-arm64/bare-arti.bare
             manifests/ios-arm64.json
+            artifact-metadata/ios-arm64.json
           if-no-files-found: error
 
   ios-arm64-simulator:
@@ -274,6 +281,8 @@ jobs:
 
           mkdir -p manifests
           node -e "const c=require('crypto'),f=require('fs');const p='prebuilds/ios-arm64-simulator/bare-arti.bare';const h=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('manifests/ios-arm64-simulator.json',JSON.stringify({[p]:h})+'\\n')"
+          mkdir -p artifact-metadata
+          node -e "const c=require('crypto'),f=require('fs'),p='prebuilds/ios-arm64-simulator/bare-arti.bare',sha256=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('artifact-metadata/ios-arm64-simulator.json',JSON.stringify({schemaVersion:1,sourceSha:process.env.GITHUB_SHA,target:'ios-arm64-simulator',kind:'addon',path:p,sha256,addonAbiVersion:2,capabilities:['reachableAddresses']})+'\\n')"
           shasum -a 256 Cargo.lock addon/Cargo.lock > lockfiles.after
           diff -u lockfiles.before lockfiles.after
 
@@ -284,6 +293,7 @@ jobs:
           path: |
             prebuilds/ios-arm64-simulator/bare-arti.bare
             manifests/ios-arm64-simulator.json
+            artifact-metadata/ios-arm64-simulator.json
           if-no-files-found: error
 
   assemble:
@@ -317,36 +327,18 @@ jobs:
       - name: Verify checksums, layout, and compressed sizes
         run: node scripts/verify-mobile-prebuild.js mobile-artifacts
 
-      - name: Inspect mobile-only npm tarball
+      - name: Assemble exact mobile release inputs
         shell: bash
         run: |
           set -euxo pipefail
-          cp -R mobile-artifacts/prebuilds .
-          npm pack --json > pack-result.json
-          package_tarball="$(node -e "process.stdout.write(require('./pack-result.json')[0].filename)")"
-          mkdir package-check
-          tar -xzf "$package_tarball" -C package-check
-
-          test -f package-check/package/addon/src/lib.rs
-          printf '%s\n' \
-            package-check/package/prebuilds/android-arm64/bare-arti.bare \
-            package-check/package/prebuilds/ios-arm64-simulator/bare-arti.bare \
-            package-check/package/prebuilds/ios-arm64/bare-arti.bare \
-            > expected-package-prebuilds.txt
-          find package-check/package/prebuilds -type f | sort > actual-package-prebuilds.txt
-          diff -u expected-package-prebuilds.txt actual-package-prebuilds.txt
-
-          test -z "$(find package-check/package -type f \
-            \( -path '*/build/*' -o -path '*/build-*/*' -o -path '*/target/*' \) -print)"
-
-          mkdir mobile-addons-assembly
-          cp -R mobile-artifacts/prebuilds mobile-addons-assembly/
-          cp -R mobile-artifacts/manifests mobile-addons-assembly/
-          cp "$package_tarball" mobile-addons-assembly/
+          test "$(find mobile-artifacts/artifact-metadata -type f | wc -l | tr -d ' ')" = 3
+          mkdir mobile-release-input
+          cp -R mobile-artifacts/prebuilds mobile-release-input/
+          cp -R mobile-artifacts/artifact-metadata mobile-release-input/
 
       - name: Upload mobile assembly
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: mobile-addons-assembly
-          path: mobile-addons-assembly/
+          name: mobile-release-input
+          path: mobile-release-input/
           if-no-files-found: error
