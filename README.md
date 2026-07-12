@@ -133,7 +133,8 @@ Linux sidecars are built in Ubuntu 22.04 containers and require glibc 2.35 or
 newer. Alpine Linux and other musl-based distributions are not currently
 supported.
 
-CI assembles all five sidecars, creates and inspects the future npm tarball, and
+CI assembles all five sidecars into a verified publication staging tree,
+creates and inspects the future npm tarball, and
 uploads that tarball plus the platform archives as a workflow artifact. A `v*`
 tag also attaches the bundle to its GitHub Release. The workflow does **not**
 publish to npm. A future npm publication must use the CI-assembled tarball, for
@@ -183,13 +184,19 @@ reachability.
 
 ## Package prebuild provenance
 
-`npm pack` and `npm publish` run a fail-closed `prepack` verifier. A publishable
-tree must contain `prebuilds/provenance.json` tied to the full source commit,
+The source checkout is marked `private` and its package allowlist excludes
+`prebuilds/`, so direct packing cannot capture accumulated local binaries and
+direct npm publication is refused even when lifecycle scripts are disabled.
+`npm run assemble:package -- <empty-destination> <full-source-sha>` is the only
+path that creates non-private publication metadata and adds prebuilds to the
+allowlist. It first runs a fail-closed verifier. A publishable staging tree must
+contain `prebuilds/provenance.json` tied to the full source commit,
 the five production sidecars, exact SHA-256 hashes for every shipped prebuild,
 and ABI/capability metadata for any addon. Missing, extra, duplicate, stale, or
 locally modified artifacts abort packaging. Build workflows assemble this
 manifest; developers should not hand-author it or publish from an accumulated
-local `prebuilds/` directory.
+local `prebuilds/` directory. The staged package retains the `prepack` check as
+defense in depth.
 
 ## Status / what's verified here
 

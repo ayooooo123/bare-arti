@@ -4,6 +4,7 @@
   "description": "Embedded Arti (Rust Tor) as a bundled SOCKS5 proxy for the dht-relay-tor stack — no external tor daemon",
   "main": "index.js",
   "addon": true,
+  "private": true,
   "files": [
     "index.js",
     "lib/**/*.js",
@@ -16,7 +17,7 @@
     "Cargo.toml",
     "Cargo.lock",
     "CMakeLists.txt",
-    "prebuilds/**"
+    "scripts/verify-package-prebuilds.js"
   ],
   "scripts": {
     "format": "prettier --write .",
@@ -24,6 +25,7 @@
     "build:addon": "bare-make generate && bare-make build && bare-make install",
     "build:sidecar": "cargo build --release --bin arti-socks",
     "prepack": "node scripts/verify-package-prebuilds.js",
+    "assemble:package": "node scripts/assemble-package.js",
     "test": "prettier --check . && node test/all.js",
     "test:addon": "bare test/addon.js"
   },

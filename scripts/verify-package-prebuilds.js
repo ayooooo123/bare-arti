@@ -142,7 +142,8 @@ function repositorySourceSha(root) {
     cwd: root,
     encoding: 'utf8'
   })
-  const sourcePath = /^(?:index\.js|binding\.[cj]s|Cargo\.(?:toml|lock)|CMakeLists\.txt|package(?:-lock)?\.json|README\.md|LICENSE|addon\/|src\/|lib\/)/
+  const sourcePath =
+    /^(?:index\.js|binding\.[cj]s|Cargo\.(?:toml|lock)|CMakeLists\.txt|package(?:-lock)?\.json|README\.md|LICENSE|addon\/|src\/|lib\/)/
   for (const line of status.split('\n')) {
     if (line === '') continue
     const state = line.slice(0, 2)

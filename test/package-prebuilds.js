@@ -5,6 +5,7 @@ const os = require('os')
 const path = require('path')
 
 const { verifyPackagePrebuilds } = require('../scripts/verify-package-prebuilds')
+const { assemblePackage } = require('../scripts/assemble-package')
 
 const SOURCE_SHA = 'a'.repeat(40)
 const SIDECARS = [
@@ -100,4 +101,40 @@ test('package provenance requires every production sidecar and current addon met
   old.addonAbiVersion = 1
   fs.writeFileSync(oldFile, JSON.stringify(old))
   t.exception(() => verifyPackagePrebuilds(oldAddon, SOURCE_SHA), /addon ABI/)
+})
+
+test('verified assembly is the only package metadata that includes prebuilds', (t) => {
+  const source = fixture(t)
+  const repository = path.join(__dirname, '..')
+  for (const relative of [
+    'index.js',
+    'binding.c',
+    'binding.js',
+    'Cargo.toml',
+    'Cargo.lock',
+    'CMakeLists.txt',
+    'LICENSE',
+    'README.md',
+    'package.json',
+    'package-lock.json',
+    'addon/Cargo.toml',
+    'addon/Cargo.lock',
+    'addon/src',
+    'src',
+    'lib',
+    'scripts/verify-package-prebuilds.js'
+  ]) {
+    fs.cpSync(path.join(repository, relative), path.join(source, relative), { recursive: true })
+  }
+  const destination = path.join(os.tmpdir(), `bare-arti-assembled-${process.pid}-${Date.now()}`)
+  t.teardown(() => fs.rmSync(destination, { recursive: true, force: true }))
+
+  assemblePackage(source, destination, SOURCE_SHA)
+  const sourcePackage = require('../package.json')
+  const assembledPackage = JSON.parse(fs.readFileSync(path.join(destination, 'package.json')))
+  t.is(sourcePackage.private, true)
+  t.absent(sourcePackage.files.find((entry) => entry.startsWith('prebuilds')))
+  t.absent(assembledPackage.private)
+  t.ok(assembledPackage.files.includes('prebuilds/**'))
+  t.ok(fs.existsSync(path.join(destination, 'prebuilds/provenance.json')))
 })
