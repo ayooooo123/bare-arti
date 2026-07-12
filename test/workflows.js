@@ -32,6 +32,15 @@ test('mobile workflow is reusable and emits exact ABI metadata without packing',
   t.absent(mobile.match(/npm pack/))
 })
 
+test('sidecar jobs install Node before generating artifact metadata', (t) => {
+  const sidecar = prebuild.slice(prebuild.indexOf('\n  sidecar:'), prebuild.indexOf('\n  mobile:'))
+  const setup = sidecar.indexOf('uses: actions/setup-node@')
+  const metadata = sidecar.indexOf("node -e \"const c=require('crypto')")
+  t.ok(setup !== -1)
+  t.ok(metadata !== -1)
+  t.ok(setup < metadata)
+})
+
 test('workflow actions are immutable and permissions are read-only', (t) => {
   for (const workflow of [mobile, prebuild]) {
     t.ok(workflow.includes('permissions:\n  contents: read'))
