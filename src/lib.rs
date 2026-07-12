@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
+use tor_netdoc::types::policy::AddrPortPattern;
 use tor_rtcompat::PreferredRuntime;
 
 pub mod service;
@@ -43,13 +44,63 @@ pub async fn bootstrap() -> Result<Client> {
             .to_string_lossy()
             .into_owned()
     });
-    bootstrap_in(&dir).await
+    let reachable_addresses = reachable_addresses_from_serialized(
+        std::env::var("BARE_ARTI_REACHABLE_ADDRESSES")
+            .map(Some)
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                std::env::VarError::NotUnicode(_) => Err(anyhow!(
+                    "BARE_ARTI_REACHABLE_ADDRESSES must contain valid UTF-8"
+                )),
+            })?
+            .as_deref(),
+    )?;
+    bootstrap_in_with_reachable_addresses(&dir, reachable_addresses.as_deref()).await
+}
+
+fn reachable_addresses_from_serialized(value: Option<&str>) -> Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(anyhow!("BARE_ARTI_REACHABLE_ADDRESSES must not be empty"));
+    }
+    let patterns = value.split(',').map(str::to_owned).collect::<Vec<_>>();
+    if patterns.iter().any(|pattern| pattern.is_empty()) {
+        return Err(anyhow!(
+            "reachable relay address patterns must not be empty"
+        ));
+    }
+    Ok(Some(patterns))
+}
+
+fn parse_reachable_address_patterns(patterns: &[String]) -> Result<Vec<AddrPortPattern>> {
+    if patterns.is_empty() {
+        return Err(anyhow!("reachable relay addresses must not be empty"));
+    }
+    patterns
+        .iter()
+        .map(|pattern| {
+            pattern
+                .parse::<AddrPortPattern>()
+                .with_context(|| format!("invalid reachable relay address pattern {pattern:?}"))
+        })
+        .collect()
 }
 
 /// Bootstrap an embedded Tor client with an explicit data directory (state +
 /// cache live under it). Use this to give a Pear/app its own persistent Tor
 /// storage so reconnects are fast.
 pub async fn bootstrap_in(data_dir: &str) -> Result<Client> {
+    bootstrap_in_with_reachable_addresses(data_dir, None).await
+}
+
+/// Bootstrap with an optional allow-list of relay addresses Arti may contact
+/// directly. This constrains Tor relay reachability, not SOCKS destinations.
+pub async fn bootstrap_in_with_reachable_addresses(
+    data_dir: &str,
+    reachable_addresses: Option<&[String]>,
+) -> Result<Client> {
     // rustls 0.23 needs a process-level crypto provider chosen explicitly.
     // Ignore the error if one is already installed (idempotent across calls).
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -61,6 +112,10 @@ pub async fn bootstrap_in(data_dir: &str) -> Result<Client> {
         .storage()
         .state_dir(CfgPath::new(format!("{data_dir}/state")))
         .cache_dir(CfgPath::new(format!("{data_dir}/cache")));
+    if let Some(reachable_addresses) = reachable_addresses {
+        let patterns = parse_reachable_address_patterns(reachable_addresses)?;
+        *builder.path_rules().reachable_addrs() = patterns;
+    }
     let config = builder.build().context("building tor config")?;
 
     // create_bootstrapped already returns an Arc<TorClient>.
@@ -275,6 +330,22 @@ mod tests {
 
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn relay_reachability_serialization_and_arti_patterns_fail_closed() {
+        assert_eq!(reachable_addresses_from_serialized(None).unwrap(), None);
+        assert!(reachable_addresses_from_serialized(Some("")).is_err());
+        assert!(reachable_addresses_from_serialized(Some("*:80,,*:443")).is_err());
+
+        let patterns = reachable_addresses_from_serialized(Some("*:80,*:443"))
+            .unwrap()
+            .unwrap();
+        let parsed = parse_reachable_address_patterns(&patterns).unwrap();
+        assert_eq!(parsed[0].to_string(), "*:80");
+        assert_eq!(parsed[1].to_string(), "*:443");
+        assert!(parse_reachable_address_patterns(&[]).is_err());
+        assert!(parse_reachable_address_patterns(&["localhost:443".into()]).is_err());
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn socks_service_shutdown_aborts_and_joins_active_connections() {

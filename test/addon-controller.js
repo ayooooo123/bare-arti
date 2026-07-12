@@ -63,6 +63,7 @@ function controllerOptions(binding, overrides = {}) {
       return Object.freeze({
         backend: 'addon',
         dataDir: options.dataDir,
+        reachableAddresses: options.reachableAddresses,
         timeout: options.timeout || 600000
       })
     },
@@ -91,6 +92,21 @@ test('valid Android addon options are normalized and frozen', (t) => {
   t.ok(Object.isFrozen(options), 'freezes the normalized options')
   t.alike({ ...process.env }, beforeEnvironment, 'does not mutate process.env')
   t.is(fs.statSync(dataDir).mode & 0o777, 0o700, 'creates mode 0700')
+})
+
+test('addon options serialize canonical relay reachability for native Arti', (t) => {
+  const root = temporaryDirectory()
+  const dataDir = path.join(root, 'state')
+  t.teardown(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  const options = validateAddonOptions(
+    { dataDir, reachableAddresses: ['*:443', '*:80', '*:443'] },
+    dependencies('ios')
+  )
+
+  t.alike(options.reachableAddresses, ['*:80', '*:443'])
+  t.is(options.reachableAddressesString, '*:80,*:443')
+  t.ok(Object.isFrozen(options.reachableAddresses))
 })
 
 test('controller passes the exact frozen validator result to native start', async (t) => {
@@ -365,10 +381,16 @@ test('matching starts share one promise and conflicting starts reject', async (t
   const first = controller.start({ dataDir: '/private/a', timeout: 1000 })
   const matching = controller.start({ dataDir: '/private/a', timeout: 1000 })
   const conflicting = controller.start({ dataDir: '/private/b', timeout: 1000 })
+  const conflictingReachability = controller.start({
+    dataDir: '/private/a',
+    timeout: 1000,
+    reachableAddresses: Object.freeze(['*:443'])
+  })
 
   t.is(first, matching, 'returns the identical startup promise')
   t.is(startCalls, 1, 'starts native once')
   t.is((await rejection(conflicting)).code, 'ERR_ARTI_CONFIG_CONFLICT')
+  t.is((await rejection(conflictingReachability)).code, 'ERR_ARTI_CONFIG_CONFLICT')
 
   nativeStart.resolve({ port: 19050 })
   const handle = await first

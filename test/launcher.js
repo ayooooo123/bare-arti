@@ -120,6 +120,43 @@ test('sidecar receives explicit dataDir in BARE_ARTI_DATA', async (t) => {
   }
 })
 
+test('sidecar receives canonical reachableAddresses in its private environment', async (t) => {
+  let childEnvironment
+  const child = fakeChild()
+  const operation = fakeSidecar(child, {
+    spawn(_bin, _args, options) {
+      childEnvironment = options.env
+      return child
+    }
+  })({ bin: '/fake/arti-socks', reachableAddresses: Object.freeze(['*:80', '*:443']) })
+
+  child.stdout.emit('data', '19050\n')
+  await operation.promise
+  t.is(childEnvironment.BARE_ARTI_REACHABLE_ADDRESSES, '*:80,*:443')
+  operation.stop()
+  child.emit('exit', 0)
+  await operation.stopped
+})
+
+test('omitted reachableAddresses clears inherited private serialization', async (t) => {
+  let childEnvironment
+  const child = fakeChild()
+  const operation = fakeSidecar(child, {
+    environment: { BARE_ARTI_REACHABLE_ADDRESSES: '*:1' },
+    spawn(_bin, _args, options) {
+      childEnvironment = options.env
+      return child
+    }
+  })({ bin: '/fake/arti-socks' })
+
+  child.stdout.emit('data', '19050\n')
+  await operation.promise
+  t.absent(childEnvironment.BARE_ARTI_REACHABLE_ADDRESSES)
+  operation.stop()
+  child.emit('exit', 0)
+  await operation.stopped
+})
+
 test('sidecar inherits BARE_ARTI_DATA without dataDir', async (t) => {
   const bin = fakeBinary(
     'arti-inherited-data',

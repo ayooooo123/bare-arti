@@ -308,8 +308,16 @@ test('matching sidecar starts share one operation', async (t) => {
       return sidecarOperation(starting.promise)
     }
   })
-  const first = backend.start({ dataDir: '/private/a', timeout: 1000 })
-  const matching = backend.start({ dataDir: '/private/a', timeout: 1000 })
+  const first = backend.start({
+    dataDir: '/private/a',
+    timeout: 1000,
+    reachableAddresses: Object.freeze(['*:80', '*:443'])
+  })
+  const matching = backend.start({
+    dataDir: '/private/a',
+    timeout: 1000,
+    reachableAddresses: Object.freeze(['*:80', '*:443'])
+  })
 
   t.is(first, matching, 'shares the identical promise')
   t.is(sidecarCalls, 1, 'spawns once')
@@ -361,6 +369,18 @@ test('active sidecar rejects conflicting config and backend', async (t) => {
 
   t.is(
     (await rejection(backend.start({ dataDir: '/private/b', timeout: 1000 }))).code,
+    'ERR_ARTI_CONFIG_CONFLICT'
+  )
+  t.is(
+    (
+      await rejection(
+        backend.start({
+          dataDir: '/private/a',
+          timeout: 1000,
+          reachableAddresses: Object.freeze(['*:80', '*:443'])
+        })
+      )
+    ).code,
     'ERR_ARTI_CONFIG_CONFLICT'
   )
   t.is(

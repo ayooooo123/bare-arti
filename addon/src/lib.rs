@@ -22,6 +22,7 @@ const MAX_TIMEOUT_MS: u64 = 1_800_000;
 #[repr(C)]
 pub struct BareArtiOptions {
     pub data_dir: *const c_char,
+    pub reachable_addresses: *const c_char,
     pub timeout_ms: u64,
     pub generation: u64,
 }
@@ -40,6 +41,7 @@ pub type BareArtiCompletion =
 unsafe fn copy_options(options: *const BareArtiOptions) -> Result<ServiceOptions, ()> {
     let options = options.as_ref().ok_or(())?;
     if options.data_dir.is_null()
+        || options.reachable_addresses.is_null()
         || !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&options.timeout_ms)
         || options.generation == 0
         || options.generation == u64::MAX
@@ -51,8 +53,24 @@ unsafe fn copy_options(options: *const BareArtiOptions) -> Result<ServiceOptions
     if !data_dir.is_absolute() {
         return Err(());
     }
+    let reachable_addresses = CStr::from_ptr(options.reachable_addresses)
+        .to_str()
+        .map_err(|_| ())?;
+    let reachable_addresses = if reachable_addresses.is_empty() {
+        None
+    } else {
+        let patterns = reachable_addresses
+            .split(',')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if patterns.iter().any(|pattern| pattern.is_empty()) {
+            return Err(());
+        }
+        Some(patterns)
+    };
     Ok(ServiceOptions {
         data_dir,
+        reachable_addresses,
         timeout: Duration::from_millis(options.timeout_ms),
         generation: options.generation,
     })
@@ -422,6 +440,7 @@ mod tests {
     fn options(path: &CString, generation: u64) -> BareArtiOptions {
         BareArtiOptions {
             data_dir: path.as_ptr(),
+            reachable_addresses: c"".as_ptr(),
             timeout_ms: 30_000,
             generation,
         }
@@ -434,6 +453,7 @@ mod tests {
             .into_bytes_with_nul();
         let raw = BareArtiOptions {
             data_dir: caller.as_ptr().cast(),
+            reachable_addresses: c"".as_ptr(),
             timeout_ms: 42_000,
             generation: 41,
         };
@@ -441,8 +461,28 @@ mod tests {
         caller[14] = b'b';
         drop(caller);
         assert_eq!(owned.data_dir, PathBuf::from("/private/arti-a"));
+        assert_eq!(owned.reachable_addresses, None);
         assert_eq!(owned.timeout, Duration::from_millis(42_000));
         assert_eq!(owned.generation, 41);
+    }
+
+    #[test]
+    fn copies_reachable_addresses_before_the_caller_buffer_drops() {
+        let path = CString::new("/private/arti").unwrap();
+        let reachable = CString::new("*:80,*:443").unwrap();
+        let raw = BareArtiOptions {
+            data_dir: path.as_ptr(),
+            reachable_addresses: reachable.as_ptr(),
+            timeout_ms: 30_000,
+            generation: 1,
+        };
+
+        let owned = unsafe { copy_options(&raw) }.unwrap();
+        drop(reachable);
+        assert_eq!(
+            owned.reachable_addresses,
+            Some(vec!["*:80".to_owned(), "*:443".to_owned()])
+        );
     }
 
     #[test]

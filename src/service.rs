@@ -17,6 +17,7 @@ type WorkerSlot = Arc<Mutex<Option<WorkerHandle>>>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServiceOptions {
     pub data_dir: PathBuf,
+    pub reachable_addresses: Option<Vec<String>>,
     pub timeout: Duration,
     pub generation: u64,
 }
@@ -77,8 +78,9 @@ pub trait ManagedSocksService: Send {
     fn shutdown(self: Box<Self>) -> ServiceFuture<'static, Result<(), ServiceError>>;
 }
 
-type BootstrapHook<C> =
-    dyn Fn(PathBuf) -> ServiceFuture<'static, Result<C, ServiceError>> + Send + Sync;
+type BootstrapHook<C> = dyn Fn(PathBuf, Option<Vec<String>>) -> ServiceFuture<'static, Result<C, ServiceError>>
+    + Send
+    + Sync;
 type BindAndServeHook<C> = dyn Fn(C) -> ServiceFuture<'static, Result<Box<dyn ManagedSocksService>, ServiceError>>
     + Send
     + Sync;
@@ -94,7 +96,10 @@ where
 {
     pub fn with_hooks<B, S>(bootstrap: B, bind_and_serve: S) -> Self
     where
-        B: Fn(PathBuf) -> ServiceFuture<'static, Result<C, ServiceError>> + Send + Sync + 'static,
+        B: Fn(PathBuf, Option<Vec<String>>) -> ServiceFuture<'static, Result<C, ServiceError>>
+            + Send
+            + Sync
+            + 'static,
         S: Fn(C) -> ServiceFuture<'static, Result<Box<dyn ManagedSocksService>, ServiceError>>
             + Send
             + Sync
@@ -137,14 +142,17 @@ impl ManagedSocksService for crate::SocksService {
 
 pub fn production_worker_factory() -> Arc<dyn WorkerFactory> {
     Arc::new(ProductionWorkerFactory::with_hooks(
-        |data_dir: PathBuf| {
+        |data_dir: PathBuf, reachable_addresses| {
             Box::pin(async move {
                 let data_dir = data_dir.to_str().ok_or_else(|| {
                     ServiceError::new("ERR_ARTI_CONFIG", "dataDir must contain valid UTF-8")
                 })?;
-                crate::bootstrap_in(data_dir)
-                    .await
-                    .map_err(|error| ServiceError::new("ERR_ARTI_BOOTSTRAP", error.to_string()))
+                crate::bootstrap_in_with_reachable_addresses(
+                    data_dir,
+                    reachable_addresses.as_deref(),
+                )
+                .await
+                .map_err(|error| ServiceError::new("ERR_ARTI_BOOTSTRAP", error.to_string()))
             })
         },
         |client| {
@@ -217,7 +225,7 @@ where
                 let _ = ready.send(Err(error.clone()));
                 return Err(error);
             }
-            result = bootstrap(data_dir) => match result {
+            result = bootstrap(data_dir, options.reachable_addresses.clone()) => match result {
                 Ok(client) => client,
                 Err(error) => {
                     let error = normalize_worker_error("ERR_ARTI_BOOTSTRAP", "Arti bootstrap failed", error);
@@ -1645,10 +1653,10 @@ mod tests {
     #[test]
     fn worker_reports_loopback_port_and_joins_service_before_success() {
         let (bootstrapped_tx, bootstrapped) = mpsc::sync_channel(0);
-        let bootstrap = move |_data_dir: PathBuf| {
+        let bootstrap = move |_data_dir: PathBuf, reachable_addresses| {
             let bootstrapped_tx = bootstrapped_tx.clone();
             Box::pin(async move {
-                bootstrapped_tx.send(()).unwrap();
+                bootstrapped_tx.send(reachable_addresses).unwrap();
                 Ok(())
             }) as ServiceFuture<'static, Result<(), ServiceError>>
         };
@@ -1691,6 +1699,7 @@ mod tests {
             .spawn(
                 ServiceOptions {
                     data_dir: data_dir.clone(),
+                    reachable_addresses: Some(vec!["*:80".into(), "*:443".into()]),
                     timeout: Duration::from_secs(60),
                     generation: 1,
                 },
@@ -1699,7 +1708,10 @@ mod tests {
             )
             .unwrap();
 
-        bootstrapped.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            bootstrapped.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(vec!["*:80".into(), "*:443".into()])
+        );
         assert_eq!(
             ready_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
             Ok(19050)
@@ -1732,13 +1744,14 @@ mod tests {
                     std::process::id(),
                     thread::current().id()
                 )),
+                reachable_addresses: None,
                 timeout: Duration::from_secs(60),
                 generation,
             }
         }
 
         let bootstrap_factory = ProductionWorkerFactory::with_hooks(
-            |_data_dir| {
+            |_data_dir, _reachable_addresses| {
                 Box::pin(async { Err(ServiceError::new("INTERNAL", "offline bootstrap failure")) })
                     as ServiceFuture<'static, Result<(), ServiceError>>
             },
@@ -1756,7 +1769,7 @@ mod tests {
         std::fs::remove_dir_all(bootstrap_options.data_dir).unwrap();
 
         let bind_factory = ProductionWorkerFactory::with_hooks(
-            |_data_dir| {
+            |_data_dir, _reachable_addresses| {
                 Box::pin(async { Ok(()) }) as ServiceFuture<'static, Result<(), ServiceError>>
             },
             |()| {
@@ -1776,7 +1789,7 @@ mod tests {
         std::fs::remove_dir_all(bind_options.data_dir).unwrap();
 
         let cancellation_factory = ProductionWorkerFactory::with_hooks(
-            |_data_dir| {
+            |_data_dir, _reachable_addresses| {
                 Box::pin(std::future::pending()) as ServiceFuture<'static, Result<(), ServiceError>>
             },
             |()| unreachable!(),
@@ -1812,7 +1825,7 @@ mod tests {
         let bootstrap_calls = Arc::new(AtomicUsize::new(0));
         let calls = bootstrap_calls.clone();
         let factory = ProductionWorkerFactory::with_hooks(
-            move |_data_dir| {
+            move |_data_dir, _reachable_addresses| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Ok(()) }) as ServiceFuture<'static, Result<(), ServiceError>>
             },
@@ -1824,6 +1837,7 @@ mod tests {
             .spawn(
                 ServiceOptions {
                     data_dir: link,
+                    reachable_addresses: None,
                     timeout: Duration::from_secs(60),
                     generation: 1,
                 },
@@ -1972,6 +1986,7 @@ mod tests {
     fn options(generation: u64, name: &str) -> ServiceOptions {
         ServiceOptions {
             data_dir: PathBuf::from(name),
+            reachable_addresses: None,
             timeout: Duration::from_secs(60),
             generation,
         }

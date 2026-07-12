@@ -23,6 +23,7 @@ arti-client = { version = "0.44", default-features = false, features = [
   "static-sqlite",
 ] }
 tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
+tor-netdoc = "0.44"
 # rustls 0.23 requires a process-level CryptoProvider to be installed explicitly.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = [

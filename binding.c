@@ -18,6 +18,7 @@ enum {
 
 typedef struct {
   const char *data_dir;
+  const char *reachable_addresses;
   uint64_t timeout_ms;
   uint64_t generation;
 } bare_arti_options_t;
@@ -485,10 +486,12 @@ bare_arti_start_raw(js_env_t *env, js_callback_info_t *info) {
 
   js_value_t *data_dir_value;
   js_value_t *timeout_value;
+  js_value_t *reachable_addresses_value;
   uint64_t generation;
   double timeout;
   if (js_get_named_property(env, argv[0], "dataDir", &data_dir_value) < 0 ||
       js_get_named_property(env, argv[0], "timeout", &timeout_value) < 0 ||
+      js_get_named_property(env, argv[0], "reachableAddressesString", &reachable_addresses_value) < 0 ||
       !bare_arti_get_generation(env, argv[1], &generation) ||
       js_get_value_double(env, timeout_value, &timeout) < 0 ||
       timeout < 1000 || timeout > 1800000 || (double) ((uint64_t) timeout) != timeout) {
@@ -496,9 +499,16 @@ bare_arti_start_raw(js_env_t *env, js_callback_info_t *info) {
     return NULL;
   }
   char *data_dir = bare_arti_get_string(env, data_dir_value);
+  char *reachable_addresses = bare_arti_get_string(env, reachable_addresses_value);
   if (data_dir == NULL || data_dir[0] != '/') {
     free(data_dir);
+    free(reachable_addresses);
     js_throw_type_error(env, "ERR_ARTI_CONFIG", "dataDir must be an absolute path");
+    return NULL;
+  }
+  if (reachable_addresses == NULL) {
+    free(data_dir);
+    js_throw_type_error(env, "ERR_ARTI_CONFIG", "invalid reachableAddresses serialization");
     return NULL;
   }
 
@@ -508,6 +518,7 @@ bare_arti_start_raw(js_env_t *env, js_callback_info_t *info) {
   bare_arti_unlock();
   if (rejected) {
     free(data_dir);
+    free(reachable_addresses);
     js_throw_error(env, "ERR_ARTI_CONFIG_CONFLICT", "Arti addon is already active");
     return NULL;
   }
@@ -522,6 +533,7 @@ bare_arti_start_raw(js_env_t *env, js_callback_info_t *info) {
   );
   if (request == NULL) {
     free(data_dir);
+    free(reachable_addresses);
     js_throw_error(env, "ERR_ARTI_BOOTSTRAP", "could not allocate addon request");
     return NULL;
   }
@@ -530,9 +542,10 @@ bare_arti_start_raw(js_env_t *env, js_callback_info_t *info) {
   realm->generation = generation;
   realm->start = request;
   bare_arti_unlock();
-  bare_arti_options_t options = {data_dir, (uint64_t) timeout, generation};
+  bare_arti_options_t options = {data_dir, reachable_addresses, (uint64_t) timeout, generation};
   int status = bare_arti_start(&options, bare_arti_on_native_result, request);
   free(data_dir);
+  free(reachable_addresses);
   if (status != BARE_ARTI_STATUS_OK) {
     bare_arti_lock();
     realm->generation = 0;

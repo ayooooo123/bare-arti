@@ -60,6 +60,14 @@ const dht = new (require('@hyperswarm/dht-relay'))(await connect({ onion }))
   user; in containers (where `/` may be owned by a different uid) the desktop
   sidecar may need this. It is a security downgrade, so it is opt-in and is
   rejected by the in-process addon rather than weakening mobile validation.
+- `reachableAddresses` — an optional non-empty list of relay endpoints that
+  Arti may contact directly. The currently supported public form is a wildcard
+  address plus one port, for example `['*:80', '*:443']`. Values are validated,
+  copied, sorted, deduplicated, and frozen before either backend starts. Omit
+  this option to preserve Arti's unrestricted `*:*` default. This is useful on
+  constrained mobile or CI networks, but it can reduce the relays Arti can use.
+  It limits **direct connections to Tor relays**, not the destinations that an
+  application can reach through the SOCKS proxy.
 - `timeout` — bootstrap timeout in ms; the first bootstrap can take 10–30s.
   The addon defaults to `600000` (10 minutes), while the desktop sidecar
   defaults to `60000` (1 minute). Both backends enforce bounded startup.
@@ -69,6 +77,16 @@ must choose a directory inside its application container and own that semantic
 guarantee. For PearTube, pass its app-private directory explicitly; use
 `BARE_ARTI_DATA` as the portable fallback in hosts that configure environment
 variables.
+
+For example, a mobile host that only permits common web egress can combine its
+app-private directory with a constrained relay policy:
+
+```js
+const tor = await arti.acquire({
+  dataDir: absoluteAppPrivateDirectory,
+  reachableAddresses: ['*:80', '*:443']
+})
+```
 
 Each `acquire()` call creates a distinct owner. The compatibility `start()` API
 represents one legacy owner even when called repeatedly with matching options;

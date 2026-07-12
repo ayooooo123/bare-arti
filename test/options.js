@@ -56,6 +56,50 @@ test('desktop sidecar permits an absent dataDir', (t) => {
   t.is(resolved.dataDir, undefined)
 })
 
+test('reachableAddresses snapshots, sorts, deduplicates, and freezes relay endpoints', (t) => {
+  const resolve = resolver('linux').beginGeneration()
+  const input = ['*:443', '*:80', '*:443']
+  const resolved = resolve({ reachableAddresses: input })
+
+  input[0] = '*:1'
+  t.alike(resolved.reachableAddresses, ['*:80', '*:443'])
+  t.ok(Object.isFrozen(resolved.reachableAddresses))
+  t.ok(Object.isFrozen(resolved))
+})
+
+for (const reachableAddresses of [
+  null,
+  false,
+  ' *:443',
+  [],
+  [80],
+  ['*:0'],
+  ['*:65536'],
+  ['*:*'],
+  ['localhost:443']
+]) {
+  test(`invalid reachableAddresses ${JSON.stringify(reachableAddresses)} fails closed`, (t) => {
+    configError(t, () => resolver('linux').beginGeneration()({ reachableAddresses }))
+  })
+}
+
+test('reachableAddresses elements are snapshotted exactly once', (t) => {
+  let reads = 0
+  const reachableAddresses = []
+  Object.defineProperty(reachableAddresses, 0, {
+    enumerable: true,
+    get() {
+      reads++
+      return reads === 1 ? '*:443' : '*:1'
+    }
+  })
+  reachableAddresses.length = 1
+
+  const resolved = resolver('linux').beginGeneration()({ reachableAddresses })
+  t.is(reads, 1)
+  t.alike(resolved.reachableAddresses, ['*:443'])
+})
+
 for (const platform of ['android', 'ios', 'ios-simulator']) {
   test(`${platform} requires a dataDir for its default addon`, (t) => {
     const resolve = resolver(platform).beginGeneration()
