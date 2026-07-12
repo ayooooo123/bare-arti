@@ -203,6 +203,17 @@ explicit tier-1 target set: Linux x64/arm64, macOS x64/arm64, Windows x64,
 Android arm64, iOS arm64, and iOS Simulator arm64. Arbitrary basenames, nested
 paths, target/path mismatches, and unsupported targets are rejected.
 
+An integration workflow that needs one exact host addon must use the separate
+private proof path. After building exactly one addon and emitting its CI-owned
+`artifact-metadata/<target>.json`, run
+`GITHUB_SHA=<full-source-sha> npm run assemble:proof -- <empty-destination> <target>`.
+The assembler derives and checks the clean Git HEAD, ABI 2 and
+`reachableAddresses` capability, target layout, source and destination hashes,
+and rejects missing or extra prebuilds. Its staged package deliberately retains
+`"private": true` and marks provenance `proofOnly: true`; pack it only as an
+ephemeral CI input with lifecycle scripts disabled. It is not a release artifact
+and cannot be published to npm.
+
 ## Status / what's verified here
 
 - ✅ The Arti core (`src/lib.rs`, `arti-socks` bin) **compiles and runs** — it

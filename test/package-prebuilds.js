@@ -7,6 +7,7 @@ const { execFileSync } = require('child_process')
 
 const { verifyPackagePrebuilds } = require('../scripts/verify-package-prebuilds')
 const { assemblePackage } = require('../scripts/assemble-package')
+const { assembleProofPackage } = require('../scripts/assemble-proof-package')
 
 const SOURCE_SHA = 'a'.repeat(40)
 const SIDECARS = [
@@ -225,4 +226,114 @@ test('clean committed checkout assembles through the exact CI CLI invocation', (
   t.is(output.trim(), destination)
   t.ok(fs.existsSync(path.join(destination, 'prebuilds/provenance.json')))
   t.absent(JSON.parse(fs.readFileSync(path.join(destination, 'package.json'))).private)
+})
+
+function proofSource(t, target = 'darwin-arm64') {
+  const { source, sourceSha } = assemblySource(t)
+  fs.rmSync(path.join(source, 'prebuilds'), { recursive: true, force: true })
+  const relative = `prebuilds/${target}/bare-arti.bare`
+  const addon = path.join(source, relative)
+  fs.mkdirSync(path.dirname(addon), { recursive: true })
+  fs.writeFileSync(addon, 'exact host addon')
+  fs.mkdirSync(path.join(source, 'artifact-metadata'))
+  fs.writeFileSync(
+    path.join(source, 'artifact-metadata', `${target}.json`),
+    JSON.stringify({
+      schemaVersion: 1,
+      sourceSha,
+      target,
+      kind: 'addon',
+      path: relative,
+      sha256: sha256(addon),
+      addonAbiVersion: 2,
+      capabilities: ['reachableAddresses']
+    })
+  )
+  return { source, sourceSha, target, relative }
+}
+
+test('exact host proof assembly stays private and contains one verified addon', (t) => {
+  const { source, sourceSha, target, relative } = proofSource(t)
+  const destination = path.join(os.tmpdir(), `bare-arti-proof-${process.pid}-${Date.now()}`)
+  t.teardown(() => fs.rmSync(destination, { recursive: true, force: true }))
+
+  assembleProofPackage(source, destination, sourceSha, target)
+  const packageJson = JSON.parse(fs.readFileSync(path.join(destination, 'package.json')))
+  const provenance = JSON.parse(
+    fs.readFileSync(path.join(destination, 'prebuilds/provenance.json'))
+  )
+  t.is(packageJson.private, true)
+  t.ok(packageJson.files.includes('prebuilds/**'))
+  t.alike(provenance, {
+    schemaVersion: 1,
+    sourceSha,
+    addonAbiVersion: 2,
+    capabilities: ['reachableAddresses'],
+    artifacts: [
+      { target, kind: 'addon', path: relative, sha256: sha256(path.join(source, relative)) }
+    ],
+    proofOnly: true
+  })
+  t.alike(
+    fs
+      .readdirSync(path.join(destination, 'prebuilds'), { recursive: true, withFileTypes: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) =>
+        path.relative(path.join(destination, 'prebuilds'), entry.parentPath + '/' + entry.name)
+      )
+      .sort(),
+    [`${target}/bare-arti.bare`, 'provenance.json']
+  )
+})
+
+test('proof assembly rejects stale metadata, extra prebuilds, dirty source, and a publish destination', (t) => {
+  const stale = proofSource(t)
+  const metadataFile = path.join(stale.source, 'artifact-metadata', `${stale.target}.json`)
+  const metadata = JSON.parse(fs.readFileSync(metadataFile))
+  metadata.sourceSha = 'b'.repeat(40)
+  fs.writeFileSync(metadataFile, JSON.stringify(metadata))
+  t.exception(
+    () =>
+      assembleProofPackage(
+        stale.source,
+        path.join(stale.source, 'stage'),
+        stale.sourceSha,
+        stale.target
+      ),
+    /source SHA/
+  )
+
+  const extra = proofSource(t)
+  fs.writeFileSync(path.join(extra.source, 'prebuilds/extra'), 'extra')
+  t.exception(
+    () =>
+      assembleProofPackage(
+        extra.source,
+        path.join(extra.source, 'stage'),
+        extra.sourceSha,
+        extra.target
+      ),
+    /exactly one addon/
+  )
+
+  const dirty = proofSource(t)
+  fs.appendFileSync(path.join(dirty.source, 'lib/options.js'), '\n// dirty\n')
+  t.exception(
+    () =>
+      assembleProofPackage(
+        dirty.source,
+        path.join(dirty.source, 'stage'),
+        dirty.sourceSha,
+        dirty.target
+      ),
+    /source is dirty/
+  )
+
+  const existing = proofSource(t)
+  const destination = path.join(existing.source, 'stage')
+  fs.mkdirSync(destination)
+  t.exception(
+    () => assembleProofPackage(existing.source, destination, existing.sourceSha, existing.target),
+    /already exists/
+  )
 })

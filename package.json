@@ -26,6 +26,7 @@
     "build:sidecar": "cargo build --release --bin arti-socks",
     "prepack": "node scripts/verify-package-prebuilds.js",
     "assemble:package": "node scripts/assemble-package.js",
+    "assemble:proof": "node scripts/assemble-proof-package.js",
     "test": "prettier --check . && node test/all.js",
     "test:addon": "bare test/addon.js"
   },
