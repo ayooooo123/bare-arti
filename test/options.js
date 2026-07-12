@@ -1,5 +1,6 @@
 const test = require('brittle')
-const path = require('path')
+const { isBare } = require('which-runtime')
+const path = isBare ? require('bare-path') : require('path')
 
 const { createOptionResolver } = require('../lib/options')
 
@@ -127,4 +128,49 @@ test('resolved options are frozen and preserve caller options', (t) => {
 
   t.ok(Object.isFrozen(resolved))
   t.is(resolved.timeout, 1234)
+})
+
+test('security-relevant option accessors are read once and returned unchanged', (t) => {
+  const reads = { backend: 0, dataDir: 0, insecureFsPermissions: 0 }
+  const options = {
+    get backend() {
+      reads.backend++
+      return 'sidecar'
+    },
+    get dataDir() {
+      reads.dataDir++
+      return reads.dataDir === 1 ? '/validated' : '/changed'
+    },
+    get insecureFsPermissions() {
+      reads.insecureFsPermissions++
+      return reads.insecureFsPermissions === 1 ? false : true
+    }
+  }
+
+  const resolved = resolver().beginGeneration()(options)
+
+  t.alike(reads, { backend: 1, dataDir: 1, insecureFsPermissions: 1 })
+  t.is(resolved.backend, 'sidecar')
+  t.is(resolved.dataDir, '/validated')
+  t.is(resolved.insecureFsPermissions, false)
+  t.ok(Object.isFrozen(resolved))
+})
+
+test('option accessor failures map to ERR_ARTI_CONFIG', (t) => {
+  const failure = new Error('getter failed')
+  const options = {
+    get dataDir() {
+      throw failure
+    }
+  }
+  let error = null
+
+  try {
+    resolver().beginGeneration()(options)
+  } catch (caught) {
+    error = caught
+  }
+
+  t.is(error && error.code, 'ERR_ARTI_CONFIG')
+  t.is(error && error.cause, failure)
 })
