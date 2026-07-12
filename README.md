@@ -60,8 +60,9 @@ const dht = new (require('@hyperswarm/dht-relay'))(await connect({ onion }))
   user; in containers (where `/` may be owned by a different uid) the desktop
   sidecar may need this. It is a security downgrade, so it is opt-in and is
   rejected by the in-process addon rather than weakening mobile validation.
-- `timeout` (default `600000`) — bootstrap timeout in ms; the first bootstrap
-  can take 10–30s. Both backends enforce a bounded startup.
+- `timeout` — bootstrap timeout in ms; the first bootstrap can take 10–30s.
+  The addon defaults to `600000` (10 minutes), while the desktop sidecar
+  defaults to `60000` (1 minute). Both backends enforce bounded startup.
 
 An absolute path is not automatically app-private. The host platform adapter
 must choose a directory inside its application container and own that semantic

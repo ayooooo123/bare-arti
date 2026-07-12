@@ -109,6 +109,7 @@ test('registry installs one frozen non-configurable versioned record', (t) => {
   t.ok(Object.isFrozen(descriptor.value))
   t.is(descriptor.configurable, false)
   t.is(descriptor.writable, false)
+  t.ok(Object.isFrozen(ownership), 'registered ownership authority is frozen')
 })
 
 for (const record of [
@@ -165,6 +166,60 @@ test('a replaceable same-realm registry property rejects', (t) => {
   }
   t.is(error && error.code, 'ERR_ARTI_CONFIG_CONFLICT')
   t.is(creates, 0)
+})
+
+for (const ownership of [
+  { acquire() {}, start() {}, stop() {} },
+  Object.freeze({
+    get acquire() {
+      throw new Error('authority getter must not run')
+    },
+    start() {},
+    stop() {}
+  }),
+  Object.freeze(Object.create({ acquire() {}, start() {}, stop() {} })),
+  (() => {
+    const authority = Proxy.revocable({}, {})
+    authority.revoke()
+    return authority.proxy
+  })()
+]) {
+  test('mutable, accessor, inherited, and revoked ownership authorities reject', (t) => {
+    const global = {}
+    Object.defineProperty(global, Symbol.for('bare-arti.ownership'), {
+      value: Object.freeze({ version: 1, ownership }),
+      configurable: false
+    })
+    let error = null
+    try {
+      getRegisteredOwnership({ global, version: 1, create: t.fail })
+    } catch (caught) {
+      error = caught
+    }
+    t.is(error && error.code, 'ERR_ARTI_CONFIG_CONFLICT')
+  })
+}
+
+test('registry rejects a no-op defineProperty proxy trap', (t) => {
+  const global = new Proxy(
+    {},
+    {
+      defineProperty() {
+        return true
+      }
+    }
+  )
+  let error = null
+  try {
+    getRegisteredOwnership({
+      global,
+      version: 1,
+      create: () => Object.freeze({ acquire() {}, start() {}, stop() {} })
+    })
+  } catch (caught) {
+    error = caught
+  }
+  t.is(error && error.code, 'ERR_ARTI_CONFIG_CONFLICT')
 })
 
 test('public composition snapshots environment per ownership generation', async (t) => {
@@ -251,6 +306,28 @@ test('public addon receives one frozen canonical option object', async (t) => {
   const error = await rejection(arti.acquire({ dataDir: '/explicit', insecureFsPermissions: true }))
   t.is(error && error.code, 'ERR_ARTI_CONFIG')
   t.is(starts.length, 2, 'invalid permissions never reach the native addon')
+})
+
+test('public ios-simulator composition selects addon and fails closed', async (t) => {
+  const starts = []
+  const arti = api({
+    platform: 'ios-simulator',
+    environment: { BARE_ARTI_DATA: '/app/private/arti' },
+    loadAddon: () => ({
+      matchesOptions: () => true,
+      start(options) {
+        starts.push(options)
+        return Promise.resolve({ backend: 'addon', port: 19050 })
+      },
+      stop: () => Promise.resolve()
+    })
+  })
+  const lease = await arti.acquire({})
+  t.is(starts[0].backend, 'addon')
+  await lease.release()
+
+  const missing = api({ platform: 'ios-simulator' })
+  t.is((await rejection(missing.acquire({}))).code, 'ERR_ARTI_CONFIG')
 })
 
 test('desktop sidecar retains its no-data default', async (t) => {

@@ -1,7 +1,13 @@
-const { isBare } = require('which-runtime')
+const { isBare, platform, arch } = require('which-runtime')
 const fs = isBare ? require('bare-fs') : require('fs')
 const path = isBare ? require('bare-path') : require('path')
 const { spawn } = isBare ? require('bare-subprocess') : require('child_process')
+const environment = isBare ? require('bare-env') : process.env
+const getuid = isBare
+  ? null
+  : typeof process.getuid === 'function'
+    ? process.getuid.bind(process)
+    : null
 
 const { createAddonController, validateAddonOptions } = require('./lib/addon-controller')
 const { createPublicApi } = require('./lib/public-api')
@@ -16,10 +22,10 @@ function loadAddon() {
     binding,
     validateOptions: (options) =>
       validateAddonOptions(options, {
-        platform: process.platform,
+        platform,
         fs,
         path,
-        getuid: typeof process.getuid === 'function' ? process.getuid.bind(process) : null
+        getuid
       }),
     setTimer: setTimeout,
     clearTimer: clearTimeout
@@ -28,23 +34,23 @@ function loadAddon() {
 }
 
 const startSidecar = createSidecar({
-  platform: process.platform,
-  arch: process.arch,
+  platform,
+  arch,
   dirname: __dirname,
   fs,
   path,
   spawn,
-  environment: process.env,
+  environment,
   setTimer: setTimeout,
   clearTimer: clearTimeout
 })
 
 module.exports = createPublicApi({
   global: globalThis,
-  platform: process.platform,
-  arch: process.arch,
+  platform,
+  arch,
   path,
-  environment: process.env,
+  environment,
   loadAddon,
   startSidecar
 })

@@ -192,7 +192,7 @@ test('mobile addon rejects an explicit non-addon backend', (t) => {
   )
 })
 
-for (const platform of ['android', 'ios']) {
+for (const platform of ['android', 'ios', 'ios-simulator']) {
   test(`mobile addon rejects a final data directory symlink on ${platform}`, (t) => {
     const root = temporaryDirectory()
     const target = path.join(root, 'target')

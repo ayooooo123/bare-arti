@@ -57,7 +57,7 @@ function observableAddon({ start, stop, matchesOptions }) {
   }
 }
 
-for (const platform of ['android', 'ios']) {
+for (const platform of ['android', 'ios', 'ios-simulator']) {
   test(`${platform} requires the addon and never falls back to sidecar`, async (t) => {
     let sidecarCalls = 0
     const missing = new Error('missing addon prebuild')
@@ -315,6 +315,31 @@ test('matching sidecar starts share one operation', async (t) => {
   t.is(sidecarCalls, 1, 'spawns once')
   starting.resolve({ port: 19050, backend: 'sidecar', stop() {} })
   await first
+})
+
+test('sidecar owner is published before invoking a reentrant factory', async (t) => {
+  let backend = null
+  let starts = 0
+  let nested = null
+  const stopped = deferred()
+  backend = createBackend({
+    platform: 'linux',
+    arch: 'x64',
+    loadAddon: t.fail,
+    startSidecar(options) {
+      starts++
+      if (starts === 1) nested = backend.start(options)
+      return sidecarOperation(Promise.resolve({ port: 19050, backend: 'sidecar' }), stopped.promise)
+    }
+  })
+
+  const outer = backend.start({ backend: 'sidecar', dataDir: '/private/arti' })
+  t.is(starts, 1)
+  t.is(nested, outer, 'reentrant matching start shares the published promise')
+  await outer
+  const stopping = backend.stop()
+  stopped.resolve()
+  await stopping
 })
 
 test('active sidecar rejects conflicting config and backend', async (t) => {

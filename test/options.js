@@ -56,7 +56,7 @@ test('desktop sidecar permits an absent dataDir', (t) => {
   t.is(resolved.dataDir, undefined)
 })
 
-for (const platform of ['android', 'ios']) {
+for (const platform of ['android', 'ios', 'ios-simulator']) {
   test(`${platform} requires a dataDir for its default addon`, (t) => {
     const resolve = resolver(platform).beginGeneration()
 
@@ -107,6 +107,30 @@ test('beginGeneration snapshots BARE_ARTI_DATA', (t) => {
   t.is(firstGeneration({}).dataDir, '/first')
   t.is(options.beginGeneration()({}).dataDir, '/second')
 })
+
+for (const environment of [
+  Object.defineProperty({}, 'BARE_ARTI_DATA', {
+    get() {
+      throw new Error('environment getter failed')
+    }
+  }),
+  (() => {
+    const environment = Proxy.revocable({}, {})
+    environment.revoke()
+    return environment.proxy
+  })()
+]) {
+  test('environment read failures map to ERR_ARTI_CONFIG', (t) => {
+    let error = null
+    try {
+      resolver('linux', environment).beginGeneration()
+    } catch (caught) {
+      error = caught
+    }
+    t.is(error && error.code, 'ERR_ARTI_CONFIG')
+    t.ok(error && error.cause)
+  })
+}
 
 for (const options of [undefined, null, false, [], 'options']) {
   test(`invalid options ${JSON.stringify(options)} reject`, (t) => {

@@ -126,6 +126,7 @@ function fixture({
 
 test('matching acquisitions create distinct frozen leases and share one backend', async (t) => {
   const f = fixture()
+  t.ok(Object.isFrozen(f.ownership), 'ownership authority is immutable')
   const first = await f.ownership.acquire({ dataDir: '/private/a' })
   const second = await f.ownership.acquire({ backend: 'addon', dataDir: '/private/a' })
 
@@ -146,6 +147,42 @@ test('matching acquisitions create distinct frozen leases and share one backend'
   const restarted = await f.ownership.acquire({ dataDir: '/private/a' })
   t.is(f.generation, 2, 'the successful final shutdown clears the resolver')
   await restarted.release()
+})
+
+test('synchronous backend reentry cannot start ownership twice', async (t) => {
+  let ownership = null
+  let starts = 0
+  let reentrantAcquire = null
+  let reentrantStart = null
+  let reentrantStop = null
+  let stops = 0
+  ownership = createOwnership({
+    beginOptionsGeneration: () => (options) => Object.freeze({ backend: 'addon', ...options }),
+    startBackend(options) {
+      starts++
+      if (starts === 1) {
+        reentrantAcquire = ownership.acquire(options)
+        reentrantStart = ownership.start(options)
+        reentrantAcquire.catch(() => {})
+        reentrantStart.catch(() => {})
+        reentrantStop = ownership.stop()
+      }
+      return Promise.resolve({ backend: 'addon', port: 19050 })
+    },
+    stopBackend() {
+      stops++
+      return Promise.resolve()
+    }
+  })
+
+  const outer = await ownership.acquire({ dataDir: '/private/arti' })
+  t.is(starts, 1, 'only the outer request enters the physical backend')
+  t.is((await rejection(reentrantAcquire)).code, 'ERR_ARTI_CANCELLED')
+  t.is((await rejection(reentrantStart)).code, 'ERR_ARTI_CANCELLED')
+  await reentrantStop
+  t.is(stops, 0, 'reentrant stop cannot stop the reserved outer acquisition')
+  await outer.release()
+  t.is(stops, 1, 'the final owner performs exactly one backend stop')
 })
 
 test('pending acquisitions reserve ownership and failure permits retry', async (t) => {

@@ -47,6 +47,7 @@ jobs:
 
       - name: Test option and ownership policy under Bare
         run: |
+          npx --no-install bare test/bare-entry.js
           npx --no-install bare test/options.js
           npx --no-install bare test/ownership.js
 
