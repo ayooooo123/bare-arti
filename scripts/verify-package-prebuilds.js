@@ -181,7 +181,7 @@ if (require.main === module) {
     const root = path.resolve(__dirname, '..')
     const expected = process.env.BARE_ARTI_SOURCE_SHA || repositorySourceSha(root)
     const result = verifyPackagePrebuilds(root, expected)
-    console.log(`verified ${result.artifacts.length} exact-source package prebuilds`)
+    console.error(`verified ${result.artifacts.length} exact-source package prebuilds`)
   } catch (error) {
     console.error(`bare-arti package prebuild verification failed: ${error.message}`)
     process.exitCode = 1

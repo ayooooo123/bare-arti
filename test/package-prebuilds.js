@@ -3,7 +3,7 @@ const crypto = require('crypto')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
-const { execFileSync } = require('child_process')
+const { execFileSync, spawnSync } = require('child_process')
 
 const { verifyPackagePrebuilds } = require('../scripts/verify-package-prebuilds')
 const { assemblePackage } = require('../scripts/assemble-package')
@@ -226,6 +226,18 @@ test('clean committed checkout assembles through the exact CI CLI invocation', (
   t.is(output.trim(), destination)
   t.ok(fs.existsSync(path.join(destination, 'prebuilds/provenance.json')))
   t.absent(JSON.parse(fs.readFileSync(path.join(destination, 'package.json'))).private)
+})
+
+test('prepack verification keeps stdout machine-readable', (t) => {
+  const { source, sourceSha } = assemblySource(t)
+  const result = spawnSync(process.execPath, ['scripts/verify-package-prebuilds.js'], {
+    cwd: source,
+    encoding: 'utf8',
+    env: { ...process.env, BARE_ARTI_SOURCE_SHA: sourceSha }
+  })
+  t.is(result.status, 0)
+  t.is(result.stdout, '')
+  t.ok(/verified 6 exact-source package prebuilds/.test(result.stderr))
 })
 
 function proofSource(t, target = 'darwin-arm64') {
