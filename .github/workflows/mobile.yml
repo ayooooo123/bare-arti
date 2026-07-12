@@ -103,8 +103,8 @@ jobs:
             --platform android \
             --arch arm64 \
             --define CMAKE_PROGRAM_PATH:PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
-          grep -F "CMAKE_C_COMPILER_AR:FILEPATH=$ANDROID_NDK_ROOT/" \
-            build-android-arm64/CMakeCache.txt
+          grep -F "$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            build-android-arm64/build.ninja
           grep -F 'addon/target/aarch64-linux-android/release/libbare_arti_addon.a' \
             build-android-arm64/build.ninja
           ! grep -F 'aarch64-unknown-android' build-android-arm64/build.ninja
