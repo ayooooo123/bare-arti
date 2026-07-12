@@ -72,7 +72,11 @@ jobs:
 
       - name: Install Android NDK 27.2.12479018
         shell: bash
-        run: sdkmanager 'ndk;27.2.12479018'
+        run: |
+          set -euxo pipefail
+          sdkmanager="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          "$sdkmanager" 'ndk;27.2.12479018'
 
       - name: Install JavaScript dependencies
         run: npm ci
