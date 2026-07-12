@@ -23,6 +23,7 @@
     "verify": "cargo build --bin arti-socks && node test/launcher.js",
     "build:addon": "bare-make generate && bare-make build && bare-make install",
     "build:sidecar": "cargo build --release --bin arti-socks",
+    "prepack": "node scripts/verify-package-prebuilds.js",
     "test": "prettier --check . && node test/all.js",
     "test:addon": "bare test/addon.js"
   },

@@ -3,7 +3,11 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
-const { createAddonController, validateAddonOptions } = require('../lib/addon-controller')
+const {
+  createAddonController,
+  validateAddonOptions,
+  validateAddonBinding
+} = require('../lib/addon-controller')
 const { ArtiError, artiError } = require('../lib/errors')
 
 const dependencies = (platform) => ({
@@ -34,6 +38,28 @@ function captureError(fn) {
 
   return error
 }
+
+test('native addon binding requires the exact ABI and capability handshake', (t) => {
+  const current = Object.freeze({
+    abiVersion: 2,
+    capabilities: 'reachableAddresses',
+    start() {},
+    stop() {}
+  })
+  t.is(validateAddonBinding(current), current)
+
+  for (const binding of [
+    null,
+    { start() {}, stop() {} },
+    { ...current, abiVersion: 1 },
+    { ...current, abiVersion: 3 },
+    { ...current, capabilities: '' },
+    { ...current, capabilities: 'reachableAddresses,unknown' }
+  ]) {
+    const error = captureError(() => validateAddonBinding(binding))
+    t.is(error && error.code, 'ERR_ARTI_ADDON_INCOMPATIBLE')
+  }
+})
 
 function deferred() {
   let resolve

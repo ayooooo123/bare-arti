@@ -145,6 +145,11 @@ The in-process addon now builds and loads through `require.addon()` on the host
 Bare runtime. Startup and shutdown settle native promises without blocking the
 Bare loop, and worker-realm teardown is covered by lifecycle stress tests.
 
+Native addons expose an exact ABI/capability handshake. This release requires
+addon ABI `2` with the `reachableAddresses` capability; older or unexpected
+binaries fail with `ERR_ARTI_ADDON_INCOMPATIBLE` before native `start()` is
+called.
+
 The `Mobile addons` workflow cross-compiles three experimental addon modules:
 
 ```text
@@ -175,6 +180,16 @@ npm run test:addon   # after a BARE_ARTI_TESTING debug addon build
 The launcher tests don't require Tor. The Tor core is verified by building and
 running `arti-socks` (above); a full circuit additionally needs Tor network
 reachability.
+
+## Package prebuild provenance
+
+`npm pack` and `npm publish` run a fail-closed `prepack` verifier. A publishable
+tree must contain `prebuilds/provenance.json` tied to the full source commit,
+the five production sidecars, exact SHA-256 hashes for every shipped prebuild,
+and ABI/capability metadata for any addon. Missing, extra, duplicate, stale, or
+locally modified artifacts abort packaging. Build workflows assemble this
+manifest; developers should not hand-author it or publish from an accumulated
+local `prebuilds/` directory.
 
 ## Status / what's verified here
 

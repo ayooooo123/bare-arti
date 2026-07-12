@@ -9,7 +9,11 @@ const getuid = isBare
     ? process.getuid.bind(process)
     : null
 
-const { createAddonController, validateAddonOptions } = require('./lib/addon-controller')
+const {
+  createAddonController,
+  validateAddonOptions,
+  validateAddonBinding
+} = require('./lib/addon-controller')
 const { createPublicApi } = require('./lib/public-api')
 const { createSidecar } = require('./lib/sidecar')
 
@@ -17,7 +21,7 @@ let addonController = null
 
 function loadAddon() {
   if (addonController) return addonController
-  const binding = require('./binding')
+  const binding = validateAddonBinding(require('./binding'))
   addonController = createAddonController({
     binding,
     validateOptions: (options) =>

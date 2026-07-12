@@ -681,6 +681,22 @@ bare_arti_exports(js_env_t *env, js_value_t *exports) {
   );
   assert(err == 0);
 
+  js_value_t *abi_version;
+  err = js_create_uint32(env, 2, &abi_version);
+  assert(err == 0);
+  err = js_set_named_property(env, exports, "abiVersion", abi_version);
+  assert(err == 0);
+  js_value_t *capabilities;
+  err = js_create_string_utf8(
+    env,
+    (const utf8_t *) "reachableAddresses",
+    -1,
+    &capabilities
+  );
+  assert(err == 0);
+  err = js_set_named_property(env, exports, "capabilities", capabilities);
+  assert(err == 0);
+
 #define V(name, fn) \
   { \
     js_value_t *value; \

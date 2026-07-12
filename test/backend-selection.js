@@ -100,6 +100,20 @@ for (const platform of ['android', 'ios', 'ios-simulator']) {
   })
 }
 
+test('addon ABI incompatibility is preserved and never starts a backend', async (t) => {
+  const incompatible = new ArtiError('ERR_ARTI_ADDON_INCOMPATIBLE', 'old native addon')
+  const backend = createBackend({
+    platform: 'android',
+    arch: 'arm64',
+    loadAddon() {
+      throw incompatible
+    },
+    startSidecar: t.fail
+  })
+
+  t.is(await rejection(backend.start({ dataDir: '/private/arti' })), incompatible)
+})
+
 test('desktop defaults to sidecar without loading addon', async (t) => {
   let addonLoads = 0
   let sidecarCalls = 0
