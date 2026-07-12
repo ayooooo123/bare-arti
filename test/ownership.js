@@ -22,7 +22,12 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function fixture({ pendingStart = false, pendingStop = false, failStop = null } = {}) {
+function fixture({
+  pendingStart = false,
+  pendingStop = false,
+  failStop = null,
+  serviceFactory = null
+} = {}) {
   let generation = 0
   let active = null
   let startCalls = 0
@@ -57,11 +62,13 @@ function fixture({ pendingStart = false, pendingStop = false, failStop = null } 
 
     nativeStarts++
     const control = deferred()
-    const service = Object.freeze({
-      backend: options.backend,
-      port: 19049 + nativeStarts,
-      stop() {}
-    })
+    const service = serviceFactory
+      ? serviceFactory(nativeStarts, options)
+      : Object.freeze({
+          backend: options.backend,
+          port: 19049 + nativeStarts,
+          stop() {}
+        })
     active = {
       options,
       control,
@@ -301,6 +308,125 @@ test('acquire during final stopping rejects until shutdown settles', async (t) =
   const restopping = restarted.release()
   f.stops[1].resolve()
   await restopping
+})
+
+test('final stop publishes its promise before calling a reentrant backend', async (t) => {
+  const nativeStop = deferred()
+  let ownership = null
+  let nativeStarts = 0
+  let nativeStops = 0
+  let reentrantAcquire = null
+  let reentrantStart = null
+  let reentrantStop = null
+  const service = Object.freeze({ backend: 'addon', port: 19050 })
+
+  ownership = createOwnership({
+    beginOptionsGeneration: () => (options) => options,
+    startBackend() {
+      nativeStarts++
+      return Promise.resolve(service)
+    },
+    stopBackend() {
+      nativeStops++
+      reentrantAcquire = ownership.acquire({ backend: 'addon' })
+      reentrantStart = ownership.start({ backend: 'addon' })
+      reentrantAcquire.catch(() => {})
+      reentrantStart.catch(() => {})
+      reentrantStop = ownership.stop()
+      return nativeStop.promise
+    }
+  })
+
+  const lease = await ownership.acquire({ backend: 'addon' })
+  const stopping = lease.release()
+  t.is(reentrantStop, stopping, 'every stop caller receives the published sentinel')
+  t.is(ownership.stop(), stopping, 'later stop callers receive the same promise')
+  t.is((await rejection(reentrantAcquire)).code, 'ERR_ARTI_CANCELLED')
+  t.is((await rejection(reentrantStart)).code, 'ERR_ARTI_CANCELLED')
+  t.is(nativeStarts, 1, 'reentrant starts never reach the backend')
+  t.is(nativeStops, 1, 'reentrant stop never enters the backend twice')
+
+  nativeStop.resolve()
+  await stopping
+  const restarted = await ownership.acquire({ backend: 'addon' })
+  t.is(nativeStarts, 2, 'state clears only after stop settlement')
+  nativeStop.resolve()
+  await restarted.release()
+})
+
+for (const kind of ['null', 'throwing backend getter', 'throwing port getter']) {
+  for (const api of ['acquire', 'start']) {
+    test(`${api} cleans a fulfilled ${kind} service before retry`, async (t) => {
+      const getterError = new Error('untrusted getter failed')
+      const f = fixture({
+        serviceFactory(attempt, options) {
+          if (attempt > 1) return Object.freeze({ backend: options.backend, port: 19050 })
+          if (kind === 'null') return null
+          return Object.defineProperties(
+            {},
+            {
+              backend:
+                kind === 'throwing backend getter'
+                  ? {
+                      get() {
+                        throw getterError
+                      }
+                    }
+                  : { value: 'addon' },
+              port:
+                kind === 'throwing port getter'
+                  ? {
+                      get() {
+                        throw getterError
+                      }
+                    }
+                  : { value: 19050 }
+            }
+          )
+        }
+      })
+
+      const error = await rejection(f.ownership[api]({ dataDir: '/private/a' }))
+      t.is(error.code, 'ERR_ARTI_BOOTSTRAP')
+      if (kind !== 'null') t.is(error.cause, getterError)
+      t.is(f.stopCalls, 1, 'malformed fulfilled backend is stopped')
+      const restarted = await f.ownership[api]({ dataDir: '/private/a' })
+      t.is(f.nativeStarts, 2, 'retry starts only after cleanup')
+      await (api === 'acquire' ? restarted.release() : restarted.stop())
+    })
+  }
+}
+
+test('malformed service retry waits for cleanup settlement', async (t) => {
+  const f = fixture({
+    pendingStop: true,
+    serviceFactory: (attempt, options) =>
+      attempt === 1 ? null : Object.freeze({ backend: options.backend, port: 19050 })
+  })
+  const malformed = f.ownership.acquire({ dataDir: '/private/a' })
+  await Promise.resolve()
+  const premature = f.ownership.acquire({ dataDir: '/private/a' })
+  t.is((await rejection(premature)).code, 'ERR_ARTI_CANCELLED')
+  f.stops[0].resolve()
+  t.is((await rejection(malformed)).code, 'ERR_ARTI_BOOTSTRAP')
+
+  const restarted = await f.ownership.acquire({ dataDir: '/private/a' })
+  t.is(f.nativeStarts, 2)
+  const stopping = restarted.release()
+  f.stops[1].resolve()
+  await stopping
+})
+
+test('malformed service cleanup failure becomes terminal shutdown', async (t) => {
+  const cleanupFailure = new Error('cleanup failed')
+  const f = fixture({ failStop: cleanupFailure, serviceFactory: () => null })
+
+  const error = await rejection(f.ownership.acquire({ dataDir: '/private/a' }))
+  t.is(error.code, 'ERR_ARTI_SHUTDOWN')
+  t.is(error.cause, cleanupFailure)
+  t.is(await rejection(f.ownership.start({ dataDir: '/private/a' })), error)
+  t.is(await rejection(f.ownership.stop()), error)
+  t.is(f.nativeStarts, 1)
 })
 
 test('stop failures become terminal ERR_ARTI_SHUTDOWN errors', async (t) => {
