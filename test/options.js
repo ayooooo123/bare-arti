@@ -3,6 +3,7 @@ const { isBare } = require('which-runtime')
 const path = isBare ? require('bare-path') : require('path')
 
 const { createOptionResolver } = require('../lib/options')
+const { ArtiError } = require('../lib/errors')
 
 function resolver(platform = 'linux', environment = {}) {
   return createOptionResolver({ platform, path, environment })
@@ -173,4 +174,26 @@ test('option accessor failures map to ERR_ARTI_CONFIG', (t) => {
 
   t.is(error && error.code, 'ERR_ARTI_CONFIG')
   t.is(error && error.cause, failure)
+})
+
+test('option accessor cannot spoof an ERR_ARTI_CONFIG error', (t) => {
+  const failure = new Error('spoofed config error')
+  failure.code = 'ERR_ARTI_CONFIG'
+  const options = {
+    get dataDir() {
+      throw failure
+    }
+  }
+  let error = null
+
+  try {
+    resolver().beginGeneration()(options)
+  } catch (caught) {
+    error = caught
+  }
+
+  t.ok(error instanceof ArtiError)
+  t.not(error, failure)
+  t.is(error.code, 'ERR_ARTI_CONFIG')
+  t.is(error.cause, failure)
 })
