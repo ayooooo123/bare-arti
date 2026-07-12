@@ -4,7 +4,7 @@ const path = isBare ? require('bare-path') : require('path')
 const { spawn } = isBare ? require('bare-subprocess') : require('child_process')
 
 const { createAddonController, validateAddonOptions } = require('./lib/addon-controller')
-const { createBackend } = require('./lib/backend')
+const { createPublicApi } = require('./lib/public-api')
 const { createSidecar } = require('./lib/sidecar')
 
 let addonController = null
@@ -39,14 +39,12 @@ const startSidecar = createSidecar({
   clearTimer: clearTimeout
 })
 
-const backend = createBackend({
+module.exports = createPublicApi({
+  global: globalThis,
   platform: process.platform,
   arch: process.arch,
+  path,
+  environment: process.env,
   loadAddon,
   startSidecar
 })
-
-module.exports = {
-  start: backend.start,
-  stop: backend.stop
-}

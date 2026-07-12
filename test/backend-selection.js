@@ -181,6 +181,33 @@ test('matching addon starts share one stored backend promise', async (t) => {
   await first
 })
 
+test('addon backend preserves a frozen normalized option object', async (t) => {
+  let received = null
+  const addon = observableAddon({
+    start(options) {
+      received = options
+      return Promise.resolve({ port: 19050, backend: 'addon' })
+    },
+    stop: () => Promise.resolve()
+  })
+  const backend = createBackend({
+    platform: 'android',
+    arch: 'arm64',
+    loadAddon: () => addon,
+    startSidecar: t.fail
+  })
+  const normalized = Object.freeze({
+    backend: 'addon',
+    dataDir: '/private/arti',
+    timeout: 1000
+  })
+
+  await backend.start(normalized)
+  t.is(received, normalized)
+  t.ok(Object.isFrozen(received))
+  await backend.stop()
+})
+
 test('canonical-equivalent addon options share one stored backend promise', async (t) => {
   const nativeStart = deferred()
   let startCalls = 0
@@ -265,8 +292,8 @@ test('backend stop delegates to the selected backend', async (t) => {
   t.is(stops, 1)
 })
 
-test('public module exports only start and stop', (t) => {
-  t.alike(Object.keys(require('..')).sort(), ['start', 'stop'])
+test('public module exports only acquire, start, and stop', (t) => {
+  t.alike(Object.keys(require('..')).sort(), ['acquire', 'start', 'stop'])
 })
 
 test('matching sidecar starts share one operation', async (t) => {

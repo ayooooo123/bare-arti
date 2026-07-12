@@ -93,6 +93,32 @@ test('valid Android addon options are normalized and frozen', (t) => {
   t.is(fs.statSync(dataDir).mode & 0o777, 0o700, 'creates mode 0700')
 })
 
+test('controller passes the exact frozen validator result to native start', async (t) => {
+  const normalized = Object.freeze({ backend: 'addon', dataDir: '/private/arti', timeout: 1000 })
+  let received = null
+  const controller = createAddonController({
+    binding: {
+      start(options) {
+        received = options
+        return Promise.resolve({ port: 19050 })
+      },
+      stop() {
+        return Promise.resolve()
+      }
+    },
+    validateOptions() {
+      return normalized
+    },
+    setTimer: setTimeout,
+    clearTimer: clearTimeout
+  })
+
+  const service = await controller.start({ dataDir: '/ignored' })
+  t.is(received, normalized)
+  t.ok(Object.isFrozen(received))
+  await service.stop()
+})
+
 test('explicit default timeout is accepted', (t) => {
   const root = temporaryDirectory()
   const dataDir = path.join(root, 'state')

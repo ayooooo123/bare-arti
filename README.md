@@ -12,7 +12,12 @@ SOCKS5 client points at that port, and nothing else in the stack changes.
 
 ## Two backends, one API
 
-`start()` returns `{ port, backend, stop() }` from whichever backend is available:
+`acquire()` returns an independent `{ port, backend, release() }` lease from
+whichever backend is available. Matching leases share one physical Arti service,
+which stops only after the final lease is released. `release()` is idempotent.
+
+The legacy `start()` API remains available and returns
+`{ port, backend, stop() }`:
 
 1. **In-process Bare addon** — a Rust `staticlib` exposed through the C ABI in
    `binding.c`, wrapped as a Bare module, and loaded via `require.addon()`.
@@ -24,7 +29,7 @@ SOCKS5 client points at that port, and nothing else in the stack changes.
 ```js
 const arti = require('bare-arti')
 
-const tor = await arti.start({ insecureFsPermissions: true }) // see note below
+const tor = await arti.acquire({ dataDir: absoluteAppPrivateDirectory })
 console.log('embedded Tor SOCKS5 on 127.0.0.1:' + tor.port)
 
 // hand the port to dht-relay-tor:
@@ -33,7 +38,7 @@ const Stream = require('dht-relay-tor')
 const dht = new DHT(await Stream.connect({ onion, proxyPort: tor.port }))
 
 // ...later
-tor.stop()
+await tor.release()
 ```
 
 Or in one call via the integration entry:
@@ -43,17 +48,37 @@ const { connect } = require('dht-relay-tor/arti')
 const dht = new (require('@hyperswarm/dht-relay'))(await connect({ onion }))
 ```
 
-## `start(options)`
+## `acquire(options)` and `start(options)`
 
-- `dataDir` — where Tor keeps its state/cache (default `$BARE_ARTI_DATA` or
-  `<tmp>/bare-arti`). Give each app its own dir for fast reconnects.
+- `dataDir` — where Tor keeps its state/cache. An explicit absolute path takes
+  precedence over `$BARE_ARTI_DATA`. The mobile addon fails closed when neither
+  is supplied; it never guesses a directory from the current working directory,
+  `/tmp`, or shared storage. The desktop sidecar alone retains Arti's no-data
+  default.
 - `insecureFsPermissions` (default `false`) — relax Arti's filesystem-ownership
   hardening. Arti refuses to use a state dir if an ancestor is owned by another
-  user; in containers (where `/` may be owned by a different uid) you need this.
-  It is a security downgrade (it stops Arti from checking that no one else can
-  read your Tor state), so it is opt-in.
+  user; in containers (where `/` may be owned by a different uid) the desktop
+  sidecar may need this. It is a security downgrade, so it is opt-in and is
+  rejected by the in-process addon rather than weakening mobile validation.
 - `timeout` (default `600000`) — bootstrap timeout in ms; the first bootstrap
   can take 10–30s. Both backends enforce a bounded startup.
+
+An absolute path is not automatically app-private. The host platform adapter
+must choose a directory inside its application container and own that semantic
+guarantee. For PearTube, pass its app-private directory explicitly; use
+`BARE_ARTI_DATA` as the portable fallback in hosts that configure environment
+variables.
+
+Each `acquire()` call creates a distinct owner. The compatibility `start()` API
+represents one legacy owner even when called repeatedly with matching options;
+`stop()` releases only that owner. Acquired leases and the legacy owner cannot
+stop one another prematurely.
+
+Duplicate `bare-arti` installations in one JavaScript realm coordinate through
+a versioned `Symbol.for('bare-arti.ownership')` registry. A conflicting registry
+record rejects with `ERR_ARTI_CONFIG_CONFLICT`. The JavaScript registry is
+same-realm only; separate Bare worker realms remain protected by the native
+singleton and reject incompatible ownership with `ERR_ARTI_REALM_CONFLICT`.
 
 ## Build
 

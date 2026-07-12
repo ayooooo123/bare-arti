@@ -45,6 +45,11 @@ jobs:
       - name: Test JavaScript package
         run: npm test
 
+      - name: Test option and ownership policy under Bare
+        run: |
+          npx --no-install bare test/options.js
+          npx --no-install bare test/ownership.js
+
       - name: Test Rust core
         run: cargo test --locked --all-targets
 
