@@ -5,6 +5,8 @@ const path = require('path')
 const root = path.join(__dirname, '..', '.github', 'workflows')
 const mobile = fs.readFileSync(path.join(root, 'mobile.yml'), 'utf8')
 const prebuild = fs.readFileSync(path.join(root, 'prebuild.yml'), 'utf8')
+const addonTest = fs.readFileSync(path.join(__dirname, 'addon.js'), 'utf8')
+const addonWorker = fs.readFileSync(path.join(__dirname, 'addon-worker.js'), 'utf8')
 
 test('release workflow requires exact mobile inputs and verified package staging', (t) => {
   for (const value of [
@@ -39,6 +41,11 @@ test('sidecar jobs install Node before generating artifact metadata', (t) => {
   t.ok(setup !== -1)
   t.ok(metadata !== -1)
   t.ok(setup < metadata)
+})
+
+test('raw ABI v2 addon fixtures supply relay reachability serialization', (t) => {
+  t.ok(addonTest.includes("reachableAddressesString: '*:80,*:443'"))
+  t.ok(addonWorker.includes("reachableAddressesString: '*:80,*:443'"))
 })
 
 test('workflow actions are immutable and permissions are read-only', (t) => {

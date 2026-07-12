@@ -5,6 +5,7 @@ let binding
 
 const options = (name, timeout = 30000) => ({
   dataDir: `/tmp/bare-arti-${name}-${Bare.pid}`,
+  reachableAddressesString: '*:80,*:443',
   timeout
 })
 

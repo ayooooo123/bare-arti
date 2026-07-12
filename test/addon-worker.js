@@ -12,7 +12,11 @@ async function main() {
   const { mode, generation } = Worker.workerData
   if (mode === 'running') {
     const result = await binding.start(
-      { dataDir: `/tmp/bare-arti-worker-${generation}`, timeout: 30000 },
+      {
+        dataDir: `/tmp/bare-arti-worker-${generation}`,
+        reachableAddressesString: '*:80,*:443',
+        timeout: 30000
+      },
       generation
     )
     Worker.parentPort.postMessage({ status: 'running', port: result.port })
@@ -21,6 +25,7 @@ async function main() {
       .start(
         {
           dataDir: `/tmp/bare-arti-${mode === 'late' ? 'slow-ready' : 'delay-start'}-${generation}`,
+          reachableAddressesString: '*:80,*:443',
           timeout: 30000
         },
         generation
