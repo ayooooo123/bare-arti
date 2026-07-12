@@ -206,6 +206,26 @@ test('legacy conflicts propagate without changing its owner', async (t) => {
   t.is(f.stopCalls, 1)
 })
 
+test('running legacy starts preserve public promise identity and ownership', async (t) => {
+  const f = fixture()
+  const first = f.ownership.start({ dataDir: '/private/a' })
+  const service = await first
+
+  t.is(f.ownership.start({ dataDir: '/private/a' }), first, 'matching promise is exact')
+  t.is(
+    f.ownership.start({ backend: 'addon', dataDir: '/private/a' }),
+    first,
+    'canonical-equivalent promise is exact'
+  )
+  t.is(
+    (await rejection(f.ownership.start({ dataDir: '/private/b' }))).code,
+    'ERR_ARTI_CONFIG_CONFLICT'
+  )
+  t.is(f.nativeStarts, 1, 'the conflict does not replace the running owner')
+  await service.stop()
+  t.is(f.stopCalls, 1, 'the original service performs the sole final stop')
+})
+
 test('a failed reservation performs the deferred final shutdown', async (t) => {
   const f = fixture()
   const lease = await f.ownership.acquire({ dataDir: '/private/a' })
