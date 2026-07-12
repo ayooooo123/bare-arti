@@ -1,3 +1,5 @@
 require('./launcher')
 require('./addon-controller')
 require('./backend-selection')
+require('./mobile-artifacts')
+require('./cargo-wrapper')

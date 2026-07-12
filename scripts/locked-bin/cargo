@@ -1,0 +1,59 @@
+#!/bin/sh
+
+set -eu
+
+: "${BARE_ARTI_REAL_CARGO:?BARE_ARTI_REAL_CARGO must name the real Cargo executable}"
+
+if [ "$#" -eq 0 ]; then
+  echo "cargo wrapper requires a subcommand" >&2
+  exit 2
+fi
+
+subcommand=$1
+shift
+arguments=$(mktemp "${TMPDIR:-/tmp}/bare-arti-cargo-arguments.XXXXXX")
+trap 'rm -f "$arguments"' EXIT HUP INT TERM
+
+printf '%s\n' "$subcommand" > "$arguments"
+rewrite_target=0
+has_locked=0
+cargo_options=1
+case "$subcommand" in
+  build|metadata) requires_locked=1 ;;
+  *) requires_locked=0 ;;
+esac
+for argument in "$@"; do
+  if [ "$cargo_options" -eq 1 ]; then
+    if [ "$argument" = "--" ] && [ "$rewrite_target" -eq 0 ]; then
+      if [ "$requires_locked" -eq 1 ] && [ "$has_locked" -eq 0 ]; then
+        printf '%s\n' --locked >> "$arguments"
+        has_locked=1
+      fi
+      cargo_options=0
+    elif [ "$rewrite_target" -eq 1 ]; then
+      if [ "$argument" = "aarch64-unknown-android" ]; then
+        argument=aarch64-linux-android
+      fi
+      rewrite_target=0
+    elif [ "$argument" = "--target" ]; then
+      rewrite_target=1
+    fi
+    if [ "$argument" = "--locked" ]; then
+      has_locked=1
+    fi
+  fi
+  printf '%s\n' "$argument" >> "$arguments"
+done
+
+if [ "$requires_locked" -eq 1 ] && [ "$has_locked" -eq 0 ]; then
+  printf '%s\n' --locked >> "$arguments"
+fi
+
+set --
+while IFS= read -r argument || [ -n "$argument" ]; do
+  set -- "$@" "$argument"
+done < "$arguments"
+
+rm -f "$arguments"
+trap - EXIT HUP INT TERM
+exec "$BARE_ARTI_REAL_CARGO" "$@"
