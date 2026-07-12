@@ -174,6 +174,9 @@ function assembleProofPackage(sourceRoot, destinationRoot, expectedSourceSha, ta
     const addonDestination = path.join(destination, metadata.path)
     fs.mkdirSync(path.dirname(addonDestination), { recursive: true })
     fs.copyFileSync(path.join(source, metadata.path), addonDestination, fs.constants.COPYFILE_EXCL)
+    if (sha256(addonDestination) !== metadata.sha256) {
+      throw new Error('proof addon changed during proof assembly')
+    }
     const packageFile = path.join(destination, 'package.json')
     const packageJson = JSON.parse(fs.readFileSync(packageFile, 'utf8'))
     if (packageJson.private !== true) throw new Error('source package must be private')
@@ -189,7 +192,7 @@ function assembleProofPackage(sourceRoot, destinationRoot, expectedSourceSha, ta
           target,
           kind: 'addon',
           path: metadata.path,
-          sha256: sha256(addonDestination)
+          sha256: metadata.sha256
         }
       ],
       proofOnly: true

@@ -337,3 +337,23 @@ test('proof assembly rejects stale metadata, extra prebuilds, dirty source, and 
     /already exists/
   )
 })
+
+test('proof assembly rejects an addon swapped after source verification', (t) => {
+  const { source, sourceSha, target, relative } = proofSource(t)
+  const destination = path.join(os.tmpdir(), `bare-arti-proof-swap-${process.pid}-${Date.now()}`)
+  t.teardown(() => fs.rmSync(destination, { recursive: true, force: true }))
+  const copyFileSync = fs.copyFileSync
+  fs.copyFileSync = function swapBeforeCopy(sourceFile, destinationFile, mode) {
+    if (sourceFile === path.join(source, relative)) fs.writeFileSync(sourceFile, 'swapped addon')
+    return copyFileSync(sourceFile, destinationFile, mode)
+  }
+  t.teardown(() => {
+    fs.copyFileSync = copyFileSync
+  })
+
+  t.exception(
+    () => assembleProofPackage(source, destination, sourceSha, target),
+    /changed during proof assembly/
+  )
+  t.absent(fs.existsSync(destination))
+})
