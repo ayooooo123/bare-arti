@@ -237,7 +237,5 @@ jobs:
             release-bundle/*.tar.gz \
             --clobber
 
-# The Bare-addon job is intentionally omitted for now. Local Rust type-checking
-# passes, but cmake-bare build/install and require.addon() loading remain
-# unverified; the current addon bootstrap also blocks and has no timeout. Add an
-# addon prebuild matrix only after that full path works on at least one runner.
+# Android and iOS addon cross-builds live in mobile.yml. They remain separate
+# from this publishable desktop-sidecar bundle until runtime/device proofs pass.

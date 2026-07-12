@@ -1,0 +1,342 @@
+name: Mobile addons
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_TOOLCHAIN: 1.96.1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Test JavaScript package
+        run: npm test
+
+      - name: Test Rust core
+        run: cargo test --locked --all-targets
+
+      - name: Test Rust addon ABI
+        run: cargo test --manifest-path addon/Cargo.toml --locked
+
+  android-arm64:
+    name: Android arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-linux-android
+
+      - name: Install Android NDK 27.2.12479018
+        shell: bash
+        run: sdkmanager 'ndk;27.2.12479018'
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build and verify Android addon
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+          export ANDROID_NDK_LATEST_HOME="$ANDROID_NDK_ROOT"
+          export ANDROID_NDK="$ANDROID_NDK_ROOT"
+          sha256sum Cargo.lock addon/Cargo.lock > lockfiles.before
+          test -x scripts/locked-bin/cargo
+          export BARE_ARTI_REAL_CARGO="$(command -v cargo)"
+          export PATH="$GITHUB_WORKSPACE/scripts/locked-bin:$PATH"
+          export CMAKE_PROGRAM_PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          export CC_aarch64_linux_android="$CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+          export AR_aarch64_linux_android="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+
+          npx --no-install bare-make generate \
+            --build build-android-arm64 \
+            --platform android \
+            --arch arm64 \
+            --define CMAKE_PROGRAM_PATH:PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
+          grep -F "CMAKE_C_COMPILER_AR:FILEPATH=$ANDROID_NDK_ROOT/" \
+            build-android-arm64/CMakeCache.txt
+          grep -F 'addon/target/aarch64-linux-android/release/libbare_arti_addon.a' \
+            build-android-arm64/build.ninja
+          ! grep -F 'aarch64-unknown-android' build-android-arm64/build.ninja
+          npx --no-install bare-make build --build build-android-arm64
+          npx --no-install bare-make install \
+            --build build-android-arm64 \
+            --prefix prebuilds \
+            --strip
+
+          expected=prebuilds/android-arm64/bare-arti.bare
+          test -f "$expected"
+          test "$(find prebuilds -type f | wc -l | tr -d ' ')" = 1
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -h "$expected" | tee android-elf-header.txt
+          grep -Eq 'Machine:.*AArch64' android-elf-header.txt
+
+          mkdir -p manifests
+          node -e "const c=require('crypto'),f=require('fs');const p='prebuilds/android-arm64/bare-arti.bare';const h=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('manifests/android-arm64.json',JSON.stringify({[p]:h})+'\\n')"
+          sha256sum Cargo.lock addon/Cargo.lock > lockfiles.after
+          diff -u lockfiles.before lockfiles.after
+
+      - name: Upload Android addon
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-android-arm64
+          path: |
+            prebuilds/android-arm64/bare-arti.bare
+            manifests/android-arm64.json
+          if-no-files-found: error
+
+  ios-arm64:
+    name: iOS device arm64
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Select Xcode 16.4
+        shell: bash
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version | tee xcode-version.txt
+          grep -Fx 'Xcode 16.4' xcode-version.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-apple-ios
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build and verify iOS device addon
+        shell: bash
+        run: |
+          set -euxo pipefail
+          shasum -a 256 Cargo.lock addon/Cargo.lock > lockfiles.before
+          test -x scripts/locked-bin/cargo
+          export BARE_ARTI_REAL_CARGO="$(command -v cargo)"
+          export PATH="$GITHUB_WORKSPACE/scripts/locked-bin:$PATH"
+          export CMAKE_PROGRAM_PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
+          export IPHONEOS_DEPLOYMENT_TARGET=14.0
+
+          npx --no-install bare-make generate \
+            --build build-ios-arm64 \
+            --platform ios \
+            --arch arm64 \
+            --define CMAKE_PROGRAM_PATH:PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
+          npx --no-install bare-make build --build build-ios-arm64
+          npx --no-install bare-make install \
+            --build build-ios-arm64 \
+            --prefix prebuilds \
+            --strip
+
+          expected=prebuilds/ios-arm64/bare-arti.bare
+          test -f "$expected"
+          test "$(find prebuilds -type f | wc -l | tr -d ' ')" = 1
+          file "$expected" | tee ios-device-file.txt
+          lipo -info "$expected" | tee ios-device-lipo.txt
+          test "$(lipo -archs "$expected")" = arm64
+
+          mkdir -p manifests
+          node -e "const c=require('crypto'),f=require('fs');const p='prebuilds/ios-arm64/bare-arti.bare';const h=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('manifests/ios-arm64.json',JSON.stringify({[p]:h})+'\\n')"
+          shasum -a 256 Cargo.lock addon/Cargo.lock > lockfiles.after
+          diff -u lockfiles.before lockfiles.after
+
+      - name: Upload iOS device addon
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-ios-arm64
+          path: |
+            prebuilds/ios-arm64/bare-arti.bare
+            manifests/ios-arm64.json
+          if-no-files-found: error
+
+  ios-arm64-simulator:
+    name: iOS Simulator arm64
+    runs-on: macos-15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Select Xcode 16.4
+        shell: bash
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version | tee xcode-version.txt
+          grep -Fx 'Xcode 16.4' xcode-version.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust 1.96.1
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.1
+          targets: aarch64-apple-ios-sim
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build and verify iOS Simulator addon
+        shell: bash
+        run: |
+          set -euxo pipefail
+          shasum -a 256 Cargo.lock addon/Cargo.lock > lockfiles.before
+          test -x scripts/locked-bin/cargo
+          export BARE_ARTI_REAL_CARGO="$(command -v cargo)"
+          export PATH="$GITHUB_WORKSPACE/scripts/locked-bin:$PATH"
+          export CMAKE_PROGRAM_PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
+          export IPHONEOS_DEPLOYMENT_TARGET=14.0
+
+          npx --no-install bare-make generate \
+            --build build-ios-arm64-simulator \
+            --platform ios \
+            --arch arm64 \
+            --simulator \
+            --define CMAKE_PROGRAM_PATH:PATH="$GITHUB_WORKSPACE/scripts/locked-bin"
+          npx --no-install bare-make build --build build-ios-arm64-simulator
+          npx --no-install bare-make install \
+            --build build-ios-arm64-simulator \
+            --prefix prebuilds \
+            --strip
+
+          expected=prebuilds/ios-arm64-simulator/bare-arti.bare
+          test -f "$expected"
+          test "$(find prebuilds -type f | wc -l | tr -d ' ')" = 1
+          file "$expected" | tee ios-simulator-file.txt
+          lipo -info "$expected" | tee ios-simulator-lipo.txt
+          test "$(lipo -archs "$expected")" = arm64
+
+          mkdir -p manifests
+          node -e "const c=require('crypto'),f=require('fs');const p='prebuilds/ios-arm64-simulator/bare-arti.bare';const h=c.createHash('sha256').update(f.readFileSync(p)).digest('hex');f.writeFileSync('manifests/ios-arm64-simulator.json',JSON.stringify({[p]:h})+'\\n')"
+          shasum -a 256 Cargo.lock addon/Cargo.lock > lockfiles.after
+          diff -u lockfiles.before lockfiles.after
+
+      - name: Upload iOS Simulator addon
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-ios-arm64-simulator
+          path: |
+            prebuilds/ios-arm64-simulator/bare-arti.bare
+            manifests/ios-arm64-simulator.json
+          if-no-files-found: error
+
+  assemble:
+    name: Assemble mobile addons
+    needs:
+      - test
+      - android-arm64
+      - ios-arm64
+      - ios-arm64-simulator
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Download architecture-verified addons
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mobile-*
+          path: mobile-artifacts
+          merge-multiple: true
+
+      - name: Verify checksums, layout, and compressed sizes
+        run: node scripts/verify-mobile-prebuild.js mobile-artifacts
+
+      - name: Inspect mobile-only npm tarball
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cp -R mobile-artifacts/prebuilds .
+          npm pack --json > pack-result.json
+          package_tarball="$(node -e "process.stdout.write(require('./pack-result.json')[0].filename)")"
+          mkdir package-check
+          tar -xzf "$package_tarball" -C package-check
+
+          test -f package-check/package/addon/src/lib.rs
+          printf '%s\n' \
+            package-check/package/prebuilds/android-arm64/bare-arti.bare \
+            package-check/package/prebuilds/ios-arm64-simulator/bare-arti.bare \
+            package-check/package/prebuilds/ios-arm64/bare-arti.bare \
+            > expected-package-prebuilds.txt
+          find package-check/package/prebuilds -type f | sort > actual-package-prebuilds.txt
+          diff -u expected-package-prebuilds.txt actual-package-prebuilds.txt
+
+          test -z "$(find package-check/package -type f \
+            \( -path '*/build/*' -o -path '*/build-*/*' -o -path '*/target/*' \) -print)"
+
+          mkdir mobile-addons-assembly
+          cp -R mobile-artifacts/prebuilds mobile-addons-assembly/
+          cp -R mobile-artifacts/manifests mobile-addons-assembly/
+          cp "$package_tarball" mobile-addons-assembly/
+
+      - name: Upload mobile assembly
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mobile-addons-assembly
+          path: mobile-addons-assembly/
+          if-no-files-found: error

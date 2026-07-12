@@ -35,6 +35,7 @@
     "bare-subprocess": "^5.0.0"
   },
   "devDependencies": {
+    "bare-make": "1.6.3",
     "bare-runtime": "^1.30.3",
     "bare-worker": "^4.4.0",
     "brittle": "^3.0.0",

@@ -100,13 +100,32 @@ one or more supported sidecars.
 The in-process addon now builds and loads through `require.addon()` on the host
 Bare runtime. Startup and shutdown settle native promises without blocking the
 Bare loop, and worker-realm teardown is covered by lifecycle stress tests.
-Mobile addon prebuilds are still pending CI verification and do not ship yet.
+
+The `Mobile addons` workflow cross-compiles three experimental addon modules:
+
+```text
+prebuilds/android-arm64/bare-arti.bare
+prebuilds/ios-arm64/bare-arti.bare
+prebuilds/ios-arm64-simulator/bare-arti.bare
+```
+
+Each target-native job checks the binary architecture, preserves both Cargo
+lockfiles, and emits a SHA-256 manifest. Assembly enforces an exact allowlist,
+checks every hash, limits each deterministically gzipped module to 30 MiB, and
+inspects a mobile-only npm tarball. That tarball is a CI inspection artifact,
+not a publishable release: a future release workflow must combine these modules
+with every verified desktop sidecar.
+
+These jobs prove complete cross-compilation only. Android and iOS support stays
+experimental until BareKit loads the addon in emulator/simulator tests and real
+devices pass Tor bootstrap, onion/Hyperswarm connectivity, and process-scoped
+socket/IP-leak audits.
 
 ## Test
 
 ```sh
 npm test   # launcher logic (spawn / port-parse / stop) against a fake proxy
-npm run test:addon # after a BARE_ARTI_TESTING debug addon build
+npm run test:addon   # after a BARE_ARTI_TESTING debug addon build
 ```
 
 The launcher tests don't require Tor. The Tor core is verified by building and
@@ -120,8 +139,8 @@ reachability.
 - ✅ The JS launcher (spawn, port parsing, teardown) is unit-tested.
 - ✅ The C ABI and host Bare addon bridge are asynchronous and lifecycle-tested.
 - ⚠️ A completed Tor circuit needs network egress to the Tor network.
-- ⚠️ Android and iOS addon artifacts still need target-native CI builds and
-  emulator/device validation before publication.
+- ⚠️ Android and iOS CI proves cross-compilation, not runtime support; BareKit
+  emulator/simulator and physical-device privacy proofs remain release gates.
 
 ## Why bundle at all?
 
