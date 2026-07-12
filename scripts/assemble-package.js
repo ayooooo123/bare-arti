@@ -46,6 +46,7 @@ function assemblePackage(sourceRoot, destinationRoot, sourceSha) {
     delete packageJson.private
     packageJson.files.push('prebuilds/**')
     fs.writeFileSync(packageFile, `${JSON.stringify(packageJson, null, 2)}\n`)
+    verifyPackagePrebuilds(destination, sourceSha)
   } catch (error) {
     fs.rmSync(destination, { recursive: true, force: true })
     throw error
