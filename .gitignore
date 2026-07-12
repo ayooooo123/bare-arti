@@ -1,5 +1,5 @@
 target
 node_modules
 prebuilds
-build
-package-lock.json
+/build*/
+/darwin-arm64/

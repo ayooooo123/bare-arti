@@ -10,9 +10,9 @@
 //! at the port returned here removes the external-daemon dependency entirely.
 //!
 //! The core here builds and runs with plain `cargo` (see `src/bin/arti-socks.rs`)
-//! so the Tor embedding is verifiable without the Bare toolchain. The Bare addon
-//! glue lives in `binding.rs` and is compiled by the staticlib manifest under
-//! `addon/`.
+//! so the Tor embedding is verifiable without the Bare toolchain. The Rust C ABI
+//! lives in the staticlib crate under `addon/`; `binding.c` bridges that ABI to
+//! Bare promises and thread-safe functions.
 
 use std::future::Future;
 use std::pin::Pin;

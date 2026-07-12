@@ -8,16 +8,15 @@ It boots an in-process Tor client and exposes a localhost SOCKS5 port; dht-relay
 SOCKS5 client points at that port, and nothing else in the stack changes.
 
 > :test_tube: Experimental. Uses [Arti](https://gitlab.torproject.org/tpo/core/arti)
-> (`arti-client`) and Holepunch's [bare-rust](https://github.com/holepunchto/bare-rust)
-> Bare-addon bindings.
+> (`arti-client`) behind a native Bare addon and a portable sidecar.
 
 ## Two backends, one API
 
 `start()` returns `{ port, backend, stop() }` from whichever backend is available:
 
-1. **In-process Bare addon** — a Rust `staticlib` + `bare-rust` binding, wrapped
-   as a Bare module and loaded via `require.addon()`. Fully embedded, no
-   subprocess. Built with `bare-make` (Pear/Bare targets).
+1. **In-process Bare addon** — a Rust `staticlib` exposed through the C ABI in
+   `binding.c`, wrapped as a Bare module, and loaded via `require.addon()`.
+   Fully embedded, no subprocess. Built with `bare-make` (Pear/Bare targets).
 2. **Sidecar binary** — a prebuilt `arti-socks` executable spawned as a child
    process. Portable across Node and Bare. The binary is exactly what
    `cargo build` produces.
@@ -53,8 +52,8 @@ const dht = new (require('@hyperswarm/dht-relay'))(await connect({ onion }))
   user; in containers (where `/` may be owned by a different uid) you need this.
   It is a security downgrade (it stops Arti from checking that no one else can
   read your Tor state), so it is opt-in.
-- `timeout` (default `60000`) — sidecar bootstrap timeout in ms; the first
-  bootstrap can take 10–30s. The addon does not support this option yet.
+- `timeout` (default `600000`) — bootstrap timeout in ms; the first bootstrap
+  can take 10–30s. Both backends enforce a bounded startup.
 
 ## Build
 
@@ -98,16 +97,16 @@ example `npm publish bare-arti-0.0.1.tgz`. Never run `npm publish` from a source
 checkout, even after a local build; otherwise the published package could omit
 one or more supported sidecars.
 
-The in-process Bare addon remains a TODO. Its Rust layer type-checks locally,
-but its cmake-bare build/install and `require.addon()` load path are not yet
-verified, so no addon prebuild ships. Its current bootstrap is synchronous and
-blocks the calling thread, and the `timeout` option is unsupported by this
-backend.
+The in-process addon now builds and loads through `require.addon()` on the host
+Bare runtime. Startup and shutdown settle native promises without blocking the
+Bare loop, and worker-realm teardown is covered by lifecycle stress tests.
+Mobile addon prebuilds are still pending CI verification and do not ship yet.
 
 ## Test
 
 ```sh
 npm test   # launcher logic (spawn / port-parse / stop) against a fake proxy
+npm run test:addon # after a BARE_ARTI_TESTING debug addon build
 ```
 
 The launcher tests don't require Tor. The Tor core is verified by building and
@@ -119,10 +118,10 @@ reachability.
 - ✅ The Arti core (`src/lib.rs`, `arti-socks` bin) **compiles and runs** — it
   initialises rustls, sets up the state manager, and begins Tor bootstrap.
 - ✅ The JS launcher (spawn, port parsing, teardown) is unit-tested.
+- ✅ The C ABI and host Bare addon bridge are asynchronous and lifecycle-tested.
 - ⚠️ A completed Tor circuit needs network egress to the Tor network.
-- ⚠️ The `bare-rust` addon binding (`src/binding.rs`, `binding.js`, `CMakeLists.txt`)
-  targets the Bare toolchain and is built/run there — it is scaffolding, not
-  exercised by the cargo build.
+- ⚠️ Android and iOS addon artifacts still need target-native CI builds and
+  emulator/device validation before publication.
 
 ## Why bundle at all?
 
@@ -149,7 +148,7 @@ cargo build --locked --release --bin arti-socks
 For local integration work, run `npm link` here and then `npm link bare-arti` in
 a checkout of
 [dht-relay-tor](https://github.com/ayooooo123/dht-relay-tor). Generated
-`target/`, `build/`, `prebuilds/`, and `node_modules/` directories must not be
+`target/`, `build*/`, `prebuilds/`, and `node_modules/` directories must not be
 committed.
 
 ## License

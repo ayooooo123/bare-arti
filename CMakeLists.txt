@@ -5,6 +5,12 @@ find_package(cmake-cargo REQUIRED PATHS node_modules/cmake-cargo)
 
 project(bare_arti C)
 
+option(BARE_ARTI_TESTING "Build deterministic addon test hooks" OFF)
+
+if(BARE_ARTI_TESTING AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(FATAL_ERROR "BARE_ARTI_TESTING is only valid for Debug builds")
+endif()
+
 # cmake-cargo 0.0.4 accepts a manifest containing one staticlib target. Keep
 # that target separate from the root crate, which also contains the sidecar bin.
 # cmake-cargo 0.0.4 parses arguments starting at index 1, so its first
@@ -24,3 +30,7 @@ target_link_libraries(
   PRIVATE
     bare_arti_addon
 )
+
+if(BARE_ARTI_TESTING)
+  target_compile_definitions(${bare_arti_module} PRIVATE BARE_ARTI_TESTING=1)
+endif()

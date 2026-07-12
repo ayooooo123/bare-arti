@@ -70,8 +70,20 @@ struct AbiService {
     requests: Mutex<RequestState>,
 }
 
+static SERVICE: OnceLock<AbiService> = OnceLock::new();
+
+#[cfg(all(debug_assertions, not(test)))]
+static TEST_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, debug_assertions))]
+fn test_mode_enabled() -> bool {
+    #[cfg(test)]
+    return true;
+    #[cfg(not(test))]
+    return TEST_MODE.load(std::sync::atomic::Ordering::Acquire);
+}
+
 fn service() -> &'static AbiService {
-    static SERVICE: OnceLock<AbiService> = OnceLock::new();
     SERVICE.get_or_init(|| AbiService {
         controller: ServiceController::new(
             worker_factory(),
@@ -83,12 +95,29 @@ fn service() -> &'static AbiService {
 
 #[cfg(not(test))]
 fn worker_factory() -> std::sync::Arc<dyn bare_arti::service::WorkerFactory> {
+    #[cfg(debug_assertions)]
+    if TEST_MODE.load(std::sync::atomic::Ordering::Acquire) {
+        return std::sync::Arc::new(TestWorkerFactory);
+    }
     production_worker_factory()
 }
 
 #[cfg(test)]
 fn worker_factory() -> std::sync::Arc<dyn bare_arti::service::WorkerFactory> {
     std::sync::Arc::new(TestWorkerFactory)
+}
+
+#[cfg(all(debug_assertions, not(test)))]
+#[no_mangle]
+pub extern "C" fn bare_arti_enable_test_mode() -> i32 {
+    if TEST_MODE.load(std::sync::atomic::Ordering::Acquire) {
+        return BARE_ARTI_STATUS_OK;
+    }
+    if SERVICE.get().is_some() {
+        return BARE_ARTI_STATUS_REJECTED;
+    }
+    TEST_MODE.store(true, std::sync::atomic::Ordering::Release);
+    BARE_ARTI_STATUS_OK
 }
 
 fn status_for(error: &ServiceError) -> i32 {
@@ -154,7 +183,22 @@ fn start_impl(
         Ok(options) => options,
         Err(()) => return BARE_ARTI_STATUS_INVALID,
     };
+    #[cfg(debug_assertions)]
+    if test_mode_enabled()
+        && options
+            .data_dir
+            .to_string_lossy()
+            .contains("native-rejection")
+    {
+        return BARE_ARTI_STATUS_REJECTED;
+    }
     let generation = options.generation;
+    #[cfg(debug_assertions)]
+    let duplicate_completion = test_mode_enabled()
+        && options
+            .data_dir
+            .to_string_lossy()
+            .contains("duplicate-completion");
     let service = service();
     {
         let Ok(mut state) = service.requests.lock() else {
@@ -174,7 +218,13 @@ fn start_impl(
                 state.active_generation = None;
             }
         }
+        #[cfg(debug_assertions)]
+        let duplicate = event.clone();
         invoke_once(callback, context, event);
+        #[cfg(debug_assertions)]
+        if duplicate_completion {
+            invoke_once(callback, context, duplicate);
+        }
     });
     match service.controller.start(options, completion) {
         Ok(()) => BARE_ARTI_STATUS_OK,
@@ -268,10 +318,10 @@ pub unsafe extern "C" fn bare_arti_stop(
     .unwrap_or(BARE_ARTI_STATUS_SHUTDOWN)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 struct TestWorkerFactory;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 impl bare_arti::service::WorkerFactory for TestWorkerFactory {
     fn spawn(
         &self,
@@ -283,8 +333,10 @@ impl bare_arti::service::WorkerFactory for TestWorkerFactory {
             .name("bare-arti-abi-test-worker".into())
             .spawn(move || {
                 if options.data_dir.to_string_lossy().contains("delay-start") {
-                    let _ = cancel.blocking_recv();
-                    return Ok(());
+                    match cancel.blocking_recv() {
+                        Ok(()) => return Ok(()),
+                        Err(_) => return Ok(()),
+                    }
                 }
                 if options
                     .data_dir
@@ -294,6 +346,9 @@ impl bare_arti::service::WorkerFactory for TestWorkerFactory {
                     let error = ServiceError::new("ERR_ARTI_BOOTSTRAP", "test bootstrap failure");
                     let _ = ready.send(Err(error.clone()));
                     return Err(error);
+                }
+                if options.data_dir.to_string_lossy().contains("slow-ready") {
+                    std::thread::sleep(Duration::from_secs(3));
                 }
                 let _ = ready.send(Ok(19_050));
                 let _ = cancel.blocking_recv();
