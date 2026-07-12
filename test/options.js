@@ -197,3 +197,19 @@ test('option accessor cannot spoof an ERR_ARTI_CONFIG error', (t) => {
   t.is(error.code, 'ERR_ARTI_CONFIG')
   t.is(error.cause, failure)
 })
+
+test('revoked option proxies map inspection failures to ERR_ARTI_CONFIG', (t) => {
+  const revocable = Proxy.revocable({}, {})
+  revocable.revoke()
+  let error = null
+
+  try {
+    resolver().beginGeneration()(revocable.proxy)
+  } catch (caught) {
+    error = caught
+  }
+
+  t.ok(error instanceof ArtiError)
+  t.is(error.code, 'ERR_ARTI_CONFIG')
+  t.ok(error.cause instanceof TypeError)
+})
